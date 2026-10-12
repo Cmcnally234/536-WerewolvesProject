@@ -1,21 +1,28 @@
 """
 ping_client.py -- stand-in "player" for testing commslib.py alone.
 
-Usage: python3 ping_client.py <socket_path> <name> [reply_delay_seconds]
+Usage:
+  local dev:   python3 ping_client.py p1 [--delay 3] [--dir /tmp/werewolf-test]
+  real users:  sudo -u player1 python3 /opt/werewolf/ping_client.py player1 \
+                   --dir /run/werewolf
 
-reply_delay lets us simulate a slow player to see the server's timeout.
+--delay simulates a slow player so you can see the server's timeout.
 """
 
+import argparse
 import asyncio
-import sys
 
-from commslib import Client, ConnectionClosed
+from commslib import Client, ConnectionClosed, player_socket_path
 
 
 async def main():
-    socket_path = sys.argv[1]
-    name = sys.argv[2]
-    delay = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
+    parser = argparse.ArgumentParser()
+    parser.add_argument("name")
+    parser.add_argument("--delay", type=float, default=0.0)
+    parser.add_argument("--dir", default="/tmp/werewolf-test")
+    args = parser.parse_args()
+    name, delay = args.name, args.delay
+    socket_path = player_socket_path(name, args.dir)
 
     client = Client()
     await client.connect(socket_path)

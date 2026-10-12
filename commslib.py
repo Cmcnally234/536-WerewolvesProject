@@ -4,8 +4,8 @@ commslib.py -- the ONLY file in this project that touches sockets.
 IPC primitive: UNIX domain *stream* sockets, driven by asyncio.
 
 Topology: star. The moderator owns one listening socket per player
-(e.g. /run/werewolf/player1/sock). Each player connects only to its own
-socket. Because file permissions decide who can open which socket, the
+(/run/werewolf/<player_id>/sock, see player_socket_path()). Each player
+connects only to its own socket. Because file permissions decide who can open which socket, the
 moderator knows *who* is on a connection by *which socket it arrived on* --
 a player cannot impersonate another player by lying in a message.
 
@@ -20,7 +20,13 @@ boundaries. Two quick send() calls can arrive as one read, and one large
 send() can arrive split across several reads. The length prefix tells the
 receiver exactly how many bytes make up the next message.
 
+Inbox event types the Server generates itself (prefixed with "_"):
+    _connected     a player took its seat
+    _disconnected  a player's connection closed
+    _rejected      SO_PEERCRED uid check failed (check_peer_uid=True)
+
 Public API:
+    player_socket_path(player_id, base_dir) -> the socket path for a seat
     Connection  -- one framed, bidirectional link (used by Server and Client)
     Server      -- moderator side: start, send_to, multicast, broadcast, recv_any
     Client      -- player side:    connect, send, recv
@@ -29,10 +35,38 @@ Public API:
 import asyncio
 import json
 import os
+import pwd
+import socket
 import struct
 
 # ">I" = big-endian ("network order") unsigned 32-bit int -> the length prefix.
 _HEADER = struct.Struct(">I")
+
+# Socket layout:  <base_dir>/<player_id>/sock
+# e.g. /run/werewolf/player1/sock. Each player's socket lives in its own
+# directory because the *directory* is what carries the per-player group and
+# permissions (created by setup_users.sh). Defined here, in one place, so the
+# moderator and the players can never disagree about where a socket lives.
+DEFAULT_SOCKET_DIR = "/run/werewolf"
+SOCKET_NAME = "sock"
+
+
+def player_socket_path(player_id: str, base_dir: str = DEFAULT_SOCKET_DIR) -> str:
+    return os.path.join(base_dir, player_id, SOCKET_NAME)
+
+
+def _peer_uid(writer: asyncio.StreamWriter) -> int:
+    """
+    Ask the kernel which uid is on the other end of a UNIX socket.
+
+    SO_PEERCRED returns a C `struct ucred { pid_t pid; uid_t uid; gid_t gid; }`
+    -- three 32-bit ints. The kernel fills it in at connect() time, so the
+    peer cannot fake it (unlike anything it writes into a message).
+    """
+    sock = writer.get_extra_info("socket")
+    creds = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+    _pid, uid, _gid = struct.unpack("3i", creds)
+    return uid
 
 # Refuse absurd lengths. If a peer sends garbage, the first 4 bytes could
 # decode to e.g. 3 GB, and we would try to buffer all of it. 1 MiB is far
@@ -114,12 +148,41 @@ class Server:
         self._listeners: list[asyncio.base_events.Server] = []
         self._paths: dict[str, str] = {}
         self._conns: dict[str, Connection] = {}
+        self._expected_uid: dict[str, int] = {}
         self._inbox: asyncio.Queue = asyncio.Queue()
         self._all_connected = asyncio.Event()
 
-    async def start(self, socket_paths: dict[str, str], mode: int = 0o660) -> None:
-        """Create a listening socket for each player_id -> path."""
-        self._paths = dict(socket_paths)
+    async def start(
+        self,
+        player_ids,
+        base_dir: str = DEFAULT_SOCKET_DIR,
+        check_peer_uid: bool = False,
+    ) -> None:
+        """
+        Create a listening socket at <base_dir>/<player_id>/sock for each
+        player.
+
+        The per-player directories must already exist. In the real setup,
+        setup_users.sh creates them owned modbot:playerN, mode 2750. We do
+        NOT create them here: a directory made by the moderator would have
+        the moderator's group, and the isolation would silently disappear.
+
+        check_peer_uid=True additionally requires each player_id to be a
+        Linux username and rejects any connection whose kernel-reported uid
+        (SO_PEERCRED) isn't that user's.
+        """
+        for player_id in player_ids:
+            seat_dir = os.path.join(base_dir, player_id)
+            if not os.path.isdir(seat_dir):
+                raise FileNotFoundError(
+                    f"{seat_dir} does not exist -- run setup_users.sh first"
+                )
+            self._paths[player_id] = player_socket_path(player_id, base_dir)
+            if check_peer_uid:
+                # KeyError here means "no such Linux user" -- fail loudly at
+                # startup rather than rejecting every connection later.
+                self._expected_uid[player_id] = pwd.getpwnam(player_id).pw_uid
+
         for player_id, path in self._paths.items():
             # A leftover socket file from a crashed run would make bind()
             # fail with "Address already in use".
@@ -132,14 +195,31 @@ class Server:
                 await self._serve_player(player_id, reader, writer)
 
             listener = await asyncio.start_unix_server(on_connect, path=path)
-            # Owner + group may connect; "other" may not. Which group owns
-            # the file is decided by the directory (see setup_users.sh).
-            os.chmod(path, mode)
+            # rw for owner (modbot) and group (playerN, inherited from the
+            # setgid directory), nothing for others. connect() on a UNIX
+            # socket requires WRITE permission on the socket file.
+            # (Between bind() and this chmod the file briefly has umask
+            # permissions, but the 2750 directory already keeps everyone
+            # except modbot and playerN out, so that window is harmless.)
+            os.chmod(path, 0o660)
             self._listeners.append(listener)
 
     async def _serve_player(self, player_id, reader, writer) -> None:
         """Runs as its own task for each connected player."""
         conn = Connection(reader, writer)
+
+        # Defence in depth: file permissions decide who can reach the socket,
+        # SO_PEERCRED confirms who actually did. This catches e.g. modbot or
+        # root (both can get past the file permissions) sitting in a seat.
+        expected = self._expected_uid.get(player_id)
+        if expected is not None:
+            uid = _peer_uid(writer)
+            if uid != expected:
+                await conn.send({"type": "error", "text": f"uid {uid} may not sit in {player_id}"})
+                await conn.close()
+                await self._inbox.put((player_id, {"type": "_rejected", "uid": uid}))
+                return
+
         if player_id in self._conns:
             # Only one live connection per seat.
             await conn.send({"type": "error", "text": "seat already taken"})
@@ -147,6 +227,7 @@ class Server:
             return
 
         self._conns[player_id] = conn
+        await self._inbox.put((player_id, {"type": "_connected"}))
         if len(self._conns) == len(self._paths):
             self._all_connected.set()
 
