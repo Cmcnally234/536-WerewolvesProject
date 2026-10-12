@@ -289,13 +289,28 @@ class Server:
         return await asyncio.wait_for(self._inbox.get(), timeout)
 
     async def close(self) -> None:
+        """
+        Orderly shutdown: stop accepting, hang up on every player, wait for
+        each connection's reader task to finish, then remove the socket
+        files. Anything already passed to send() is still delivered: closing
+        a UNIX stream socket sends EOF *after* the bytes already queued in
+        the kernel, never instead of them.
+        """
         for listener in self._listeners:
-            listener.close()
-        for conn in list(self._conns.values()):
-            await conn.close()
+            listener.close()                 # no new connections
+        await asyncio.gather(*(conn.close() for conn in list(self._conns.values())))
+        for listener in self._listeners:
+            try:
+                # Returns once every connection handler (_serve_player) has
+                # exited. Bounded, so one wedged peer can't hang shutdown.
+                await asyncio.wait_for(listener.wait_closed(), 2)
+            except TimeoutError:
+                pass
         for path in self._paths.values():
-            if os.path.exists(path):
+            try:
                 os.unlink(path)
+            except FileNotFoundError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -363,5 +378,8 @@ class Client:
     async def close(self) -> None:
         if self._reader_task is not None:
             self._reader_task.cancel()
+            # Wait for the cancellation to finish so the task isn't left
+            # dangling ("Task was destroyed but it is pending!").
+            await asyncio.gather(self._reader_task, return_exceptions=True)
         if self._conn is not None:
             await self._conn.close()
