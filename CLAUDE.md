@@ -177,7 +177,9 @@ sudo ./test_permissions.sh      # real users only
   - stale-code detection.
 - **By the user, 2026-10-17:** ran the `README.md` testing guide as real Linux users (automated tests, `test_permissions.sh`, bot game, multi-terminal human game, breakage tests) and reported that it worked.
 
-**Not yet run:** `run_game.sh` itself as root. Its `sudo -u`, `setsid` and `install -o` paths have never been run for real.
+- **By the user, 2026-10-17:** ran `sudo ./run_game.sh` as root and reported that it works.
+
+Everything has now been run on the real multi-user setup. Handover archive: `~/werewolf.tar.gz` (built with `git archive` from commit `97d71d7`).
 
 ## Known issues and shortcuts
 
@@ -191,7 +193,6 @@ sudo ./test_permissions.sh      # real users only
 
 ## Remaining work
 
-1. Run `sudo ./run_game.sh` for real: an all-bot game, `-H 1,2` with humans, and `-S` for the timeout path.
-2. The PDF writeup. `ARCHITECTURE.md` has the text, the diagram (ASCII), and the message table. Still needed:
+1. The PDF writeup. `ARCHITECTURE.md` has the text, the diagram (ASCII), and the message table. Still needed:
    - screenshots: `test_permissions.sh` output, a multi-terminal game, the timeout path, `GAME_OVER`, the `run_game.sh` summary, `ps -o user,pid,cmd -C python3` showing one user per process;
    - optionally, a nicer rendering of the topology diagram.
