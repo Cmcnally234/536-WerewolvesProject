@@ -1,2 +1,8 @@
 __pycache__/
 *.pyc
+# Project 2: TLS material
+certs/
+*.key
+*.pem
+*.csr
+*.srl
