@@ -22,11 +22,12 @@ receiver exactly how many bytes make up the next message.
 
 Inbox event types the Server generates itself (prefixed with "_"):
     _connected     a player took its seat
-    _disconnected  a player's connection closed
+    _disconnected  a player's connection closed ("reason" says why)
     _rejected      SO_PEERCRED uid check failed (check_peer_uid=True)
 
 Public API:
     player_socket_path(player_id, base_dir) -> the socket path for a seat
+    ConnectionClosed, ProtocolError -- link failures (both ConnectionError)
     Connection  -- one framed, bidirectional link (used by Server and Client)
     Server      -- moderator side: start, send_to, multicast, broadcast, recv_any
     Client      -- player side:    connect, send, recv
@@ -74,8 +75,34 @@ def _peer_uid(writer: asyncio.StreamWriter) -> int:
 MAX_MESSAGE_BYTES = 1024 * 1024
 
 
-class ConnectionClosed(Exception):
-    """Raised by recv() when the other side has hung up."""
+# How long a single send may wait for the peer to make room before we give
+# up on that peer. A player whose process is stopped (Ctrl-Z) or wedged stops
+# reading; once its kernel buffer fills, drain() would wait forever and --
+# because broadcast() waits for every send -- freeze the whole game with it.
+DEFAULT_SEND_TIMEOUT = 5.0
+
+# How long close() waits for buffered bytes to flush before hard-aborting.
+# A graceful close waits until the peer has read everything we queued, which
+# never happens if the peer has stopped reading.
+CLOSE_TIMEOUT = 2.0
+
+
+class ConnectionClosed(ConnectionError):
+    """
+    The link is gone (peer hung up, reset, timed out or broke the protocol).
+
+    A ConnectionError subclass, so code that already catches ConnectionError
+    (e.g. Game.tell) handles every link failure without listing them all.
+    """
+
+
+class ProtocolError(ConnectionClosed):
+    """
+    The peer sent a frame we refuse: oversized, not UTF-8, not JSON, or not
+    a JSON object. We hang up on such a peer rather than skip the frame: a
+    peer that sends one bad frame is buggy or hostile, and in either case
+    nothing it sends afterwards can be trusted.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -114,18 +141,44 @@ class Connection:
             header = await self._reader.readexactly(_HEADER.size)
             (length,) = _HEADER.unpack(header)
             if length > MAX_MESSAGE_BYTES:
-                raise ConnectionClosed(f"peer sent oversized frame ({length} bytes)")
+                raise ProtocolError(f"peer sent oversized frame ({length} bytes)")
             body = await self._reader.readexactly(length)
-        except (asyncio.IncompleteReadError, ConnectionResetError) as e:
-            # IncompleteReadError = EOF arrived mid-message (or before one).
+        except ConnectionClosed:
+            raise  # our own oversized-frame error; it's an OSError too
+        except asyncio.IncompleteReadError as e:
+            # EOF arrived mid-message (or before one).
             raise ConnectionClosed("peer closed the connection") from e
-        return json.loads(body.decode("utf-8"))
+        except OSError as e:
+            # Resets, broken pipes, and (later) TCP/TLS errors -- ssl.SSLError
+            # is an OSError too. All mean the same thing to the caller.
+            raise ConnectionClosed(f"connection error: {e!r}") from e
+
+        # The frame boundary is intact here, but the contents still come from
+        # the peer and may be garbage. Without these checks a bad body would
+        # raise an exception the reader loops don't expect (killing them
+        # silently), and a valid-JSON non-dict like [1, 2] would reach the
+        # game logic and crash it on msg.get().
+        try:
+            msg = json.loads(body.decode("utf-8"))
+        except ValueError as e:  # UnicodeDecodeError and JSONDecodeError
+            raise ProtocolError(f"peer sent a malformed frame: {e}") from e
+        if not isinstance(msg, dict):
+            raise ProtocolError(f"peer sent a {type(msg).__name__}, not an object")
+        return msg
+
+    def abort(self) -> None:
+        """Drop the link immediately, discarding anything still buffered."""
+        self._writer.transport.abort()
 
     async def close(self) -> None:
         self._writer.close()
         try:
-            await self._writer.wait_closed()
-        except (ConnectionResetError, BrokenPipeError):
+            # Bounded: a graceful close waits for our unsent bytes to be read,
+            # and a peer that has stopped reading would make that forever.
+            await asyncio.wait_for(self._writer.wait_closed(), CLOSE_TIMEOUT)
+        except TimeoutError:
+            self.abort()
+        except OSError:
             pass  # already gone; nothing to clean up
 
 
@@ -144,7 +197,8 @@ class Server:
     to await recv_any() -- it never blocks on any single player.
     """
 
-    def __init__(self):
+    def __init__(self, send_timeout: float = DEFAULT_SEND_TIMEOUT):
+        self.send_timeout = send_timeout
         self._listeners: list[asyncio.base_events.Server] = []
         self._paths: dict[str, str] = {}
         self._conns: dict[str, Connection] = {}
@@ -215,15 +269,13 @@ class Server:
         if expected is not None:
             uid = _peer_uid(writer)
             if uid != expected:
-                await conn.send({"type": "error", "text": f"uid {uid} may not sit in {player_id}"})
-                await conn.close()
+                await self._refuse(conn, f"uid {uid} may not sit in {player_id}")
                 await self._inbox.put((player_id, {"type": "_rejected", "uid": uid}))
                 return
 
         if player_id in self._conns:
             # Only one live connection per seat.
-            await conn.send({"type": "error", "text": "seat already taken"})
-            await conn.close()
+            await self._refuse(conn, "seat already taken")
             return
 
         self._conns[player_id] = conn
@@ -231,18 +283,36 @@ class Server:
         if len(self._conns) == len(self._paths):
             self._all_connected.set()
 
+        reason = "closed"
         try:
             while True:
                 msg = await conn.recv()
                 await self._inbox.put((player_id, msg))
-        except ConnectionClosed:
-            pass
+        except ConnectionClosed as e:
+            reason = str(e)
+        except Exception as e:
+            # Anything else is a bug, but it must still end in _disconnected:
+            # otherwise the seat looks connected forever and the game waits
+            # on a player nobody is reading from.
+            reason = f"reader failed: {e!r}"
         finally:
             # Tell the game logic this player is gone, through the same
             # inbox, so it learns about it in order with everything else.
-            self._conns.pop(player_id, None)
-            await self._inbox.put((player_id, {"type": "_disconnected"}))
+            # put_nowait: the inbox is unbounded, and a finally block that
+            # may be running under cancellation shouldn't await anything
+            # it doesn't have to.
+            if self._conns.get(player_id) is conn:
+                del self._conns[player_id]
+            self._inbox.put_nowait((player_id, {"type": "_disconnected", "reason": reason}))
             await conn.close()
+
+    async def _refuse(self, conn: Connection, text: str) -> None:
+        """Best-effort error message, then hang up. Never raises."""
+        try:
+            await asyncio.wait_for(conn.send({"type": "error", "text": text}), self.send_timeout)
+        except (TimeoutError, ConnectionError):
+            pass  # the peer is being turned away anyway
+        await conn.close()
 
     async def wait_for_players(self, timeout: float | None = None) -> None:
         """Block until every seat has a connection (or raise TimeoutError)."""
@@ -254,11 +324,30 @@ class Server:
     # --- sending: 1:1, multicast, broadcast -------------------------------
 
     async def send_to(self, player_id: str, msg: dict) -> None:
-        """1:1 -- send to exactly one player."""
+        """
+        1:1 -- send to exactly one player.
+
+        Raises KeyError if the seat is empty, ConnectionError (usually
+        ConnectionClosed) if the send fails or the player hasn't made room
+        for it within send_timeout seconds.
+        """
         conn = self._conns.get(player_id)
         if conn is None:
             raise KeyError(f"{player_id} is not connected")
-        await conn.send(msg)
+        try:
+            await asyncio.wait_for(conn.send(msg), self.send_timeout)
+        except TimeoutError:
+            # Cancelling here can't corrupt the stream: Connection.send()
+            # hands the whole frame to write() in one synchronous call, so
+            # the timeout can only interrupt the drain() *after* it. But the
+            # player isn't reading, and every later send would pile up in
+            # memory behind this one. Hang up instead: the reader task sees
+            # the link drop and posts _disconnected, so the game learns about
+            # it the same way as any other disconnect.
+            conn.abort()
+            raise ConnectionClosed(
+                f"{player_id} stopped reading (send timed out after {self.send_timeout}s)"
+            ) from None
 
     async def multicast(self, player_ids, msg: dict) -> list[str]:
         """
@@ -333,14 +422,24 @@ class Client:
         self._conn: Connection | None = None
         self._inbox: asyncio.Queue = asyncio.Queue()
         self._reader_task: asyncio.Task | None = None
+        self._closed_reason = "moderator closed the connection"
 
     async def _read_loop(self) -> None:
         try:
             while True:
                 await self._inbox.put(await self._conn.recv())
-        except ConnectionClosed:
-            # Sentinel so a waiting recv() wakes up instead of hanging.
-            await self._inbox.put(None)
+        except ConnectionClosed as e:
+            self._closed_reason = str(e)
+        except Exception as e:
+            # A bug or an error we didn't foresee. Record it rather than
+            # re-raise: nobody awaits this task, so a raised exception would
+            # only surface as a log line at exit.
+            self._closed_reason = f"reader failed: {e!r}"
+        finally:
+            # The sentinel goes in on EVERY exit path -- EOF, garbage frame,
+            # unexpected exception, or cancellation by close(). Without it a
+            # player blocked in recv() would wait forever on a dead link.
+            self._inbox.put_nowait(None)
 
     async def connect(self, socket_path: str, retry_seconds: float = 10.0) -> None:
         """
@@ -372,7 +471,7 @@ class Client:
         msg = await asyncio.wait_for(self._inbox.get(), timeout)
         if msg is None:
             self._inbox.put_nowait(None)  # keep later recv() calls failing too
-            raise ConnectionClosed("moderator closed the connection")
+            raise ConnectionClosed(self._closed_reason)
         return msg
 
     async def close(self) -> None:

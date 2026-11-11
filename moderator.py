@@ -206,9 +206,10 @@ class Game:
             return msg
 
         # Each ROLE_ASSIGN is a separate 1:1 message -- a broadcast would
-        # hand everyone's role to everyone. gather() sends them concurrently.
+        # hand everyone's role to everyone. gather() sends them concurrently;
+        # tell() so one unreachable player can't abort the deal for the rest.
         await asyncio.gather(
-            *(self.server.send_to(pid, role_message(pid)) for pid in self.players)
+            *(self.tell(pid, role_message(pid)) for pid in self.players)
         )
 
     # --- stage B: night -----------------------------------------------------

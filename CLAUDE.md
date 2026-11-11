@@ -28,6 +28,7 @@ Python 3.14, Fedora (SELinux enforcing). Standard library only.
 | `test_no_role_leak.py` | Full 6-player bot games; asserts villagers never receive role info outside `GAME_OVER`. Includes a self-test proving the checker can fail. |
 | `test_night.py` | Night phase: early finish, a silent Seer gets a no-op, everyone silent, the Doctor no-repeat rule. |
 | `test_day.py` | In-process `FakeServer` tests (majority, tie, timeout, spectators, early vote, self-vote) plus one real-process live chat relay test. |
+| `test_commslib.py` | In-process commslib failure paths: malformed / non-dict / non-UTF-8 / oversized frames, Client sentinel on garbage and on a reader bug, `send_to` timeout on a stuck reader, `close()` with a stuck peer. |
 | `test_game.py` | Whole games (winner matches the rules, everyone exits 0, no socket files left), SIGTERM/SIGINT to the moderator, SIGTERM to a player mid-game. |
 | `README.md` | Grader-facing (someone else runs this on another machine): commslib name/location callout at the top, requirements, setup, "no compilation needed", how to play, the full **commslib API reference** (with a tested example), file list, testing guide, troubleshooting, uninstall. Keep it in sync when the API or flags change. |
 | `run_game.sh` | Launches one game as real users: the moderator (foreground, as modbot) and the bot seats (background, `setsid sudo -u playerN`). Prints the command for each human seat. Refuses stale `/opt/werewolf` code. |
@@ -98,6 +99,7 @@ In-game commands: `/kill`, `/peek` or `/heal <name|number>`; `/w <msg>` (wolf wh
 ### Tests (run from the project dir as your normal user; each takes 5–20s)
 
 ```bash
+python3 test_commslib.py
 python3 test_no_role_leak.py
 python3 test_night.py
 python3 test_day.py

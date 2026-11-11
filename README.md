@@ -209,6 +209,7 @@ Each message on the wire is one frame:
 - Stream sockets don't preserve message boundaries; the length prefix is what lets the receiver know where each message ends.
 - The receiver reads exactly 4 bytes, then exactly N bytes.
 - Frames larger than `MAX_MESSAGE_BYTES` (1 MiB) are refused.
+- A frame whose body isn't UTF-8 JSON, or is JSON but not an object (e.g. `[1, 2]`), is a `ProtocolError`. The receiver hangs up on that peer.
 
 ### Module-level names
 
@@ -217,18 +218,21 @@ Each message on the wire is one frame:
 | `player_socket_path(player_id: str, base_dir: str = "/run/werewolf") -> str` | Returns `<base_dir>/<player_id>/sock`. Both sides use it, so they always agree on the path. |
 | `DEFAULT_SOCKET_DIR = "/run/werewolf"` | Default `base_dir` |
 | `MAX_MESSAGE_BYTES = 1048576` | Largest accepted frame body |
-| `class ConnectionClosed(Exception)` | Raised when the other end has hung up |
+| `class ConnectionClosed(ConnectionError)` | The link is gone: the other end hung up, the connection reset, a send timed out, or the peer broke the protocol. `str(e)` says which. |
+| `class ProtocolError(ConnectionClosed)` | The peer sent an oversized or malformed frame |
+| `DEFAULT_SEND_TIMEOUT = 5.0` | Default for `Server(send_timeout=...)` |
+| `CLOSE_TIMEOUT = 2.0` | How long `close()` waits for buffered data to flush before aborting |
 
 ### `class Server`: the moderator's side
 
-Create one with `server = Server()`, then:
+Create one with `server = Server(send_timeout=5.0)`, then:
 
 | Method | Description |
 |---|---|
 | `await start(player_ids, base_dir="/run/werewolf", check_peer_uid=False)` | Opens a listening socket at `<base_dir>/<id>/sock` for each id and sets it to mode `0660`. A stale socket file left over from a crash is removed first. **The seat directories must already exist** (`setup_users.sh` creates them); raises `FileNotFoundError` if one is missing. With `check_peer_uid=True`, each `player_id` must be a Linux username (`KeyError` otherwise), and connections whose SO_PEERCRED uid doesn't match are rejected. |
 | `await wait_for_players(timeout=None)` | Returns once every seat has a connection. Raises `TimeoutError` if `timeout` seconds pass first. |
 | `connected() -> list[str]` | The ids currently connected (*not* a coroutine) |
-| `await send_to(player_id, msg: dict)` | **1:1**: send to one player. Raises `KeyError` if that player isn't connected. |
+| `await send_to(player_id, msg: dict)` | **1:1**: send to one player. Raises `KeyError` if that player isn't connected. If the player doesn't make room for the message within `send_timeout` seconds (a stopped or wedged process), the server drops that connection, the reader posts `_disconnected`, and this raises `ConnectionClosed`. |
 | `await multicast(player_ids, msg: dict) -> list[str]` | **Multicast**: send the same message to a subset of players, **concurrently**. A failed send to one player doesn't stop the others. Returns the ids that could not be reached. |
 | `await broadcast(msg: dict) -> list[str]` | **Broadcast**: `multicast` to every connected player. Returns the unreachable ids. |
 | `await recv_any(timeout=None) -> (player_id, msg)` | Next message from **any** player, in arrival order. Raises `TimeoutError` if nothing arrives within `timeout` seconds. |
@@ -239,7 +243,7 @@ Create one with `server = Server()`, then:
 | `msg["type"]` | Meaning |
 |---|---|
 | `"_connected"` | That player has taken its seat |
-| `"_disconnected"` | That player's connection closed |
+| `"_disconnected"` | That player's connection closed; `msg["reason"]` says why |
 | `"_rejected"` | SO_PEERCRED check failed (`msg["uid"]` holds the offending uid). The connection was refused. |
 
 **What the server sends on its own** (the game never needs to): if a second connection arrives for an occupied seat, or a uid check fails, the server sends that connection `{"type": "error", "text": ...}` and closes it.
@@ -254,7 +258,7 @@ Create one with `client = Client()`, then:
 |---|---|
 | `await connect(socket_path, retry_seconds=10.0)` | Connect to the moderator. Retries every 0.2s while the socket doesn't exist yet or refuses the connection (the moderator may still be starting), for up to `retry_seconds`. A `PermissionError` (wrong user for this seat) is raised immediately. |
 | `await send(msg: dict)` | Send one message to the moderator |
-| `await recv(timeout=None) -> dict` | Next message from the moderator. Raises `TimeoutError` if `timeout` expires, or `ConnectionClosed` if the moderator hung up. |
+| `await recv(timeout=None) -> dict` | Next message from the moderator. Raises `TimeoutError` if `timeout` expires, or `ConnectionClosed` if the link is gone for any reason (including a malformed frame). It never hangs on a dead link. |
 | `await close()` | Stop the background reader and close the connection |
 
 The Client also reads in a background task that feeds a queue. As a result, a `recv(timeout)` that times out can never cut a frame in half.
@@ -264,8 +268,9 @@ The Client also reads in a background task that feeds a queue. As a result, a `r
 | Method | Description |
 |---|---|
 | `await send(msg: dict)` | Frame and send one message, then wait until the OS has accepted the bytes (`drain()`). Raises `TypeError` if `msg` isn't a dict, and `ValueError` if it's over 1 MiB. A lock stops concurrent sends from interleaving their bytes. |
-| `await recv() -> dict` | Read exactly one frame. Raises `ConnectionClosed` on EOF, on a connection reset, or on an oversized frame. |
-| `await close()` | Close the link |
+| `await recv() -> dict` | Read exactly one frame and return it as a dict. Raises `ConnectionClosed` on EOF or any socket error, and `ProtocolError` on an oversized or malformed frame. |
+| `abort()` | Drop the link immediately, discarding unsent data |
+| `await close()` | Close the link, waiting up to `CLOSE_TIMEOUT` for unsent data to flush, then aborting |
 
 ### Minimal example
 
@@ -328,6 +333,7 @@ The game's own message types (`ROLE_ASSIGN`, `NIGHT_PROMPT`, `CHAT`, `VOTE_TALLY
 | `test_night.py` | Automated: night phase, including the timeout for silent players and the Doctor rule |
 | `test_day.py` | Automated: chat relay, voting, ties, spectators |
 | `test_game.py` | Automated: whole games, win conditions, clean shutdown on signals |
+| `test_commslib.py` | Automated: commslib failure paths (malformed frames, a stuck reader, a dead link) |
 | `ARCHITECTURE.md` | Design document: diagram, framing, permissions, message table, concurrency |
 | `README.md` | This file |
 | `CLAUDE.md` | Development notes, used by the AI assistant that helped write the code |
@@ -343,10 +349,10 @@ Run these from the project directory. Each step builds on the one before, so a f
 These run every process as your own user, using temporary socket directories.
 
 ```bash
-python3 test_no_role_leak.py && python3 test_night.py && python3 test_day.py && python3 test_game.py
+python3 test_commslib.py && python3 test_no_role_leak.py && python3 test_night.py && python3 test_day.py && python3 test_game.py
 ```
 
-All four should end with `PASS` / `all ... tests passed`.
+All five should end with `PASS` / `all ... tests passed`.
 
 The commslib demo on its own (one slow client shows the timeout):
 
