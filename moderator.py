@@ -6,7 +6,7 @@ ever learn what the moderator chooses to send them, which is how roles stay
 secret even though every message passes through one process.
 
     local dev:   python3 moderator.py p1 p2 p3 p4 --dir /tmp/ww --local
-    over TCP:    python3 moderator.py p1 p2 p3 p4 --port 5555 [--host 0.0.0.0]
+    over TLS:    python3 moderator.py p1 p2 p3 p4 --port 5555 --tls DIR [--host 0.0.0.0]
     real users:  sudo -u modbot python3 /opt/werewolf/moderator.py \\
                      --peercred player1 player2 player3 player4
 
@@ -34,13 +34,17 @@ import sys
 from dataclasses import dataclass, field
 
 import roles
-from commslib import Server
+from commslib import DEFAULT_TLS_DIR, Server
 
 
 def log(text: str) -> None:
     # The moderator's own console is the "god view" -- printing roles here
     # is fine; it never goes over a socket.
     print(f"[moderator] {text}", flush=True)
+
+
+def log_rejected(pid: str | None, msg: dict) -> None:
+    log(f"rejected a connection{f' for {pid}' if pid else ''}: {msg.get('reason')}")
 
 
 @dataclass
@@ -142,7 +146,7 @@ class Game:
         if kind == "_connected":
             return True    # leftover join notice from the lobby
         if kind == "_rejected":
-            log(f"rejected a connection{f' for {pid}' if pid else ''}: {msg.get('reason')}")
+            log_rejected(pid, msg)
             return True
         if kind == "_disconnected":
             log(f"{pid} disconnected ({msg.get('reason')})")
@@ -487,12 +491,46 @@ class Game:
         await self.game_over(self.winner())
 
 
+async def lobby(server: Server, players: list[str], timeout: float) -> bool:
+    """
+    Wait until every seat is connected at the same moment, logging joins,
+    departures and refused connections as they happen. (Reading the inbox
+    here, rather than waiting on Server.wait_for_players, is what makes a
+    rejected certificate show up in the log while people are still joining.)
+    Returns False if `timeout` runs out first.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    # Who's here according to the events we've *read*, not server.connected():
+    # that one runs ahead of the inbox, so it could say "full" while the last
+    # joins are still unread and unlogged.
+    joined: set[str] = set()
+    while len(joined) < len(players):
+        try:
+            pid, msg = await server.recv_any(timeout=max(deadline - loop.time(), 0))
+        except TimeoutError:
+            return False
+        kind = msg.get("type")
+        if kind == "_connected":
+            joined.add(pid)
+            log(f"{pid} joined ({len(joined)}/{len(players)})")
+        elif kind == "_disconnected":
+            joined.discard(pid)
+            log(f"{pid} left the lobby ({msg.get('reason')})")
+        elif kind == "_rejected":
+            log_rejected(pid, msg)
+        else:
+            try:
+                await server.send_to(pid, {"type": "error", "text": "The game hasn't started yet."})
+            except (KeyError, ConnectionError):
+                pass
+    return True
+
+
 async def session(server: Server, args, holder: dict) -> int:
     """Lobby, then the game. Runs as one task so a signal can cancel it."""
     log(f"waiting for {args.players} (up to {args.join_timeout:.0f}s)")
-    try:
-        await server.wait_for_players(timeout=args.join_timeout)
-    except TimeoutError:
+    if not await lobby(server, args.players, args.join_timeout):
         missing = sorted(set(args.players) - set(server.connected()))
         log(f"gave up waiting for {missing}")
         return 1
@@ -511,6 +549,8 @@ async def main() -> int:
                         help="listen on TCP instead of UNIX sockets (0 = any free port)")
     parser.add_argument("--host", default="127.0.0.1",
                         help="TCP address to listen on (default loopback only)")
+    parser.add_argument("--tls", default=DEFAULT_TLS_DIR,
+                        help=f"TLS files from make_certs.sh (default {DEFAULT_TLS_DIR})")
     parser.add_argument("--peercred", action="store_true",
                         help="enforce SO_PEERCRED (player ids must be Linux users)")
     parser.add_argument("--seed", type=int, help="fix the role shuffle")
@@ -537,10 +577,14 @@ async def main() -> int:
             os.makedirs(os.path.join(args.dir, pid), exist_ok=True)
 
     server = Server()
-    await server.start(args.players, base_dir=args.dir, check_peer_uid=args.peercred,
-                       host=args.host, port=args.port)
+    try:
+        await server.start(args.players, base_dir=args.dir, check_peer_uid=args.peercred,
+                           host=args.host, port=args.port, tls_dir=args.tls)
+    except OSError as e:   # e.g. TLS key missing or unreadable, port in use
+        print(f"could not start: {e}", file=sys.stderr)
+        return 2
     if server.port is not None:
-        log(f"listening on TCP {args.host}:{server.port}")
+        log(f"listening on TCP+TLS {args.host}:{server.port} (certificates from {args.tls})")
 
     holder: dict = {}
     task = asyncio.create_task(session(server, args, holder))

@@ -10,10 +10,11 @@ transports (the framing and the API are identical on both):
   decide who can open which socket, the moderator knows *who* is on a
   connection by *which socket it arrived on*.
 
-  TCP (Project 2, across machines). The moderator listens on ONE host:port.
-  A player's first frame is HELLO naming its seat; the moderator answers
-  WELCOME or an error. Stage 1 trusts that name; stage 2 (TLS) will take
-  it from the player's certificate instead. See DISTRIBUTED.md.
+  TCP + mutual TLS (Project 2, across machines). The moderator listens on
+  ONE host:port. Both ends present certificates signed by the game's own CA
+  (make_certs.sh). The seat is the CN of the player's *verified*
+  certificate; the player's HELLO must name that same seat, and the
+  moderator answers WELCOME or an error. See DISTRIBUTED.md.
 
 Topology: star either way -- players only ever talk to the moderator.
 
@@ -32,11 +33,13 @@ Inbox event types the Server generates itself (prefixed with "_"):
     _connected     a player took its seat
     _disconnected  a player's connection closed ("reason" says why)
     _rejected      a connection was turned away ("reason" says why): wrong
-                   uid (SO_PEERCRED), seat already taken, or (TCP) a HELLO
-                   naming no seat -- that one has player id None
+                   uid (SO_PEERCRED), seat already taken, or (TCP) a failed
+                   TLS handshake / a certificate or HELLO naming no seat or
+                   the wrong one -- those have player id None
 
 Public API:
     player_socket_path(player_id, base_dir) -> the socket path for a seat
+    tls_paths(identity, tls_dir) -> (CA cert, cert, key) for TLS
     ConnectionClosed, ProtocolError -- link failures (both ConnectionError)
     Connection  -- one framed, bidirectional link (used by Server and Client)
     Server      -- moderator side: start, send_to, multicast, broadcast, recv_any
@@ -49,6 +52,7 @@ import json
 import os
 import pwd
 import socket
+import ssl
 import struct
 
 # ">I" = big-endian ("network order") unsigned 32-bit int -> the length prefix.
@@ -100,9 +104,66 @@ CLOSE_TIMEOUT = 2.0
 
 # --- TCP ------------------------------------------------------------------
 
-# Loopback by default: until stage 2 adds TLS, anyone who can reach the port
-# can claim any free seat, so don't listen on the network unless asked to.
+# Loopback by default: least exposure unless the operator asks for more
+# (--host 0.0.0.0 to accept players from other machines).
 DEFAULT_TCP_HOST = "127.0.0.1"
+
+# TLS file layout, created by make_certs.sh:
+#   <tls_dir>/ca.crt                     the game CA (trusted by both sides)
+#   <tls_dir>/<identity>/cert.pem        that identity's certificate
+#   <tls_dir>/<identity>/key.pem         its private key (0600, owned by it)
+# <identity> is MODERATOR_ID or a player id. Defined here, in one place, for
+# the same reason as player_socket_path().
+DEFAULT_TLS_DIR = "/etc/werewolf/tls"
+MODERATOR_ID = "moderator"
+
+
+def tls_paths(identity: str, tls_dir: str = DEFAULT_TLS_DIR) -> tuple[str, str, str]:
+    """(CA certificate, certificate, private key) paths for `identity`."""
+    return (os.path.join(tls_dir, "ca.crt"),
+            os.path.join(tls_dir, identity, "cert.pem"),
+            os.path.join(tls_dir, identity, "key.pem"))
+
+
+def _tls_context(identity: str, tls_dir: str, server_side: bool) -> ssl.SSLContext:
+    """
+    The TLS settings for one end. Both ends:
+      - trust ONLY the game CA (cafile given => the system's public CAs are
+        not loaded), so a certificate from anywhere else is worthless here;
+      - present their own certificate (that's what makes it *mutual*);
+      - require TLS 1.3 -- both ends are ours, so there's no old peer to
+        stay compatible with.
+    """
+    ca, cert, key = tls_paths(identity, tls_dir)
+    purpose = ssl.Purpose.CLIENT_AUTH if server_side else ssl.Purpose.SERVER_AUTH
+    try:
+        ctx = ssl.create_default_context(purpose, cafile=ca)
+        ctx.load_cert_chain(cert, key)
+    except OSError as e:   # FileNotFoundError, PermissionError, ssl.SSLError
+        raise OSError(f"can't load TLS files for {identity!r} from {tls_dir}: {e}") from e
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    if server_side:
+        # A server context doesn't ask for client certificates by default.
+        # CERT_REQUIRED: no certificate, or one our CA didn't sign, fails
+        # the handshake -- before a single byte of game data is read.
+        ctx.verify_mode = ssl.CERT_REQUIRED
+    # Client side, create_default_context already did the right thing:
+    # CERT_REQUIRED plus check_hostname, so the moderator's certificate must
+    # be signed by our CA AND list the address we dialled in its SANs.
+    return ctx
+
+
+def _cert_common_name(cert: dict | None) -> str | None:
+    """
+    The subject CN from a verified peer certificate, or None if it doesn't
+    have exactly one. getpeercert() gives the subject as a tuple of RDNs,
+    each a tuple of (field, value) pairs.
+    """
+    if not cert:
+        return None
+    names = [value for rdn in cert.get("subject", ()) for field, value in rdn
+             if field == "commonName"]
+    return names[0] if len(names) == 1 else None
 
 # How long either side waits for the other's half of the HELLO/WELCOME
 # handshake, and how long a player waits for the TCP connect itself (an
@@ -149,7 +210,10 @@ class ConnectionClosed(ConnectionError):
 
 
 class SeatRefused(ConnectionClosed):
-    """Client.connect() over TCP: the moderator answered HELLO with an error."""
+    """
+    Client.connect() over TCP: the moderator turned us away -- it answered
+    HELLO with an error, or rejected our certificate during the handshake.
+    """
 
 
 class ProtocolError(ConnectionClosed):
@@ -261,6 +325,8 @@ class Server:
     def __init__(self, send_timeout: float = DEFAULT_SEND_TIMEOUT):
         self.send_timeout = send_timeout
         self.port: int | None = None      # TCP: the port actually bound
+        self._tls: ssl.SSLContext | None = None
+        self._handshaking: set[asyncio.Task] = set()   # TCP: not seated yet
         self._seats: list[str] = []
         self._listeners: list[asyncio.base_events.Server] = []
         self._paths: dict[str, str] = {}
@@ -277,6 +343,7 @@ class Server:
         *,
         host: str | None = None,
         port: int | None = None,
+        tls_dir: str = DEFAULT_TLS_DIR,
     ) -> None:
         """
         Start listening for the given seats.
@@ -291,12 +358,13 @@ class Server:
         Linux username and rejects any connection whose kernel-reported uid
         (SO_PEERCRED) isn't that user's.
 
-        port given -> TCP: one listener on host:port (port=0 picks a free
-        port; read it back from self.port). base_dir is unused.
+        port given -> TCP + mutual TLS: one listener on host:port (port=0
+        picks a free port; read it back from self.port), using the
+        moderator's certificate and the CA from tls_dir. base_dir is unused.
         """
         self._seats = list(player_ids)
         if port is not None:
-            await self._start_tcp(host or DEFAULT_TCP_HOST, port, check_peer_uid)
+            await self._start_tcp(host or DEFAULT_TCP_HOST, port, check_peer_uid, tls_dir)
         else:
             await self._start_unix(base_dir, check_peer_uid)
 
@@ -334,11 +402,17 @@ class Server:
             os.chmod(path, 0o660)
             self._listeners.append(listener)
 
-    async def _start_tcp(self, host: str, port: int, check_peer_uid: bool) -> None:
+    async def _start_tcp(self, host: str, port: int, check_peer_uid: bool,
+                         tls_dir: str) -> None:
         if check_peer_uid:
             # SO_PEERCRED only exists for UNIX sockets: over TCP the kernel
             # has no idea which local user (if any) is on the far end.
             raise ValueError("check_peer_uid needs UNIX sockets; it can't work over TCP")
+        # Built before listening, so a missing or unreadable key fails here,
+        # at startup, instead of on every connection.
+        self._tls = _tls_context(MODERATOR_ID, tls_dir, server_side=True)
+        # The listener itself is plain TCP: _accept_tcp upgrades each
+        # connection to TLS itself (see there for why).
         # reuse_address (SO_REUSEADDR): restarting the moderator right after
         # a game would otherwise fail with "Address already in use" while
         # the old connections sit in TIME_WAIT for a minute.
@@ -366,16 +440,45 @@ class Server:
         await self._serve_seat(player_id, conn)
 
     async def _accept_tcp(self, reader, writer) -> None:
-        """
-        Runs as its own task for each TCP connection.
+        """Runs as its own task for each TCP connection: handshake, then the seat."""
+        # Tracked until seated, so close() can cancel a handshake in progress.
+        task = asyncio.current_task()
+        self._handshaking.add(task)
+        try:
+            seated = await self._handshake_tcp(reader, writer)
+        finally:
+            self._handshaking.discard(task)
+        if seated is not None:
+            await self._serve_seat(*seated, welcome=True)
 
-        All seats share one port, so the seat isn't known until the peer
-        says which one it wants. STAGE 1 ONLY: that claim is trusted as-is,
-        so anyone who can reach the port can take any free seat. Stage 2
-        replaces it with the name in the peer's verified TLS certificate.
+    async def _handshake_tcp(self, reader, writer) -> tuple[str, Connection] | None:
+        """
+        TLS handshake, then HELLO. Returns (seat, connection) to seat, or
+        None if the connection was turned away (and already closed).
+
+        All seats share one port, so the seat can't come from the socket as
+        it does with UNIX. It comes from the player's certificate, which the
+        TLS handshake has verified against our CA -- the same kind of
+        unforgeable fact the socket path is for UNIX. The HELLO's "player"
+        field is only *checked* against it, never trusted on its own.
         """
         _tune_tcp(writer)
+        try:
+            # The TLS handshake runs here instead of inside start_server(ssl=)
+            # so that a failed handshake comes back to US as an exception we
+            # can report (_rejected) -- start_server would only log it.
+            # Bounded, like HELLO: a peer that never finishes the handshake
+            # must not hold the task open.
+            await writer.start_tls(self._tls, ssl_handshake_timeout=HELLO_TIMEOUT)
+        except (OSError, TimeoutError) as e:   # ssl.SSLError is an OSError
+            writer.transport.abort()
+            reason = getattr(e, "reason", None) or str(e) or type(e).__name__
+            await self._inbox.put((None, {"type": "_rejected",
+                                          "reason": f"TLS handshake failed: {reason}"}))
+            return None
+
         conn = Connection(reader, writer)
+        cert_name = _cert_common_name(writer.get_extra_info("peercert"))
         try:
             # Bounded: a connection that never sends HELLO must not hold a
             # task (and a file descriptor) open forever. Cancelling a recv
@@ -383,18 +486,25 @@ class Server:
             hello = await asyncio.wait_for(conn.recv(), HELLO_TIMEOUT)
         except (TimeoutError, ConnectionError):
             await conn.close()
-            return
+            return None
         claimed = hello.get("player")
         if hello.get("type") != "HELLO" or not isinstance(claimed, str):
             await self._refuse(conn, "expected HELLO first")
-            return
-        if claimed not in self._seats:
-            reason = f"no seat named {claimed!r}"
-            await self._refuse(conn, reason)
-            # Not a seat, so there's no player id to file it under.
-            await self._inbox.put((None, {"type": "_rejected", "reason": reason}))
-            return
-        await self._serve_seat(claimed, conn, welcome=True)
+            return None
+
+        if cert_name not in self._seats:
+            # Signed by our CA, but not for any seat in this game (an old
+            # player name, the moderator's own certificate, ...).
+            reason = f"certificate is for {cert_name!r}, which is not a seat in this game"
+        elif claimed != cert_name:
+            # e.g. player2's certificate trying to sit in player1's seat.
+            reason = f"certificate is for {cert_name!r}, not {claimed!r}"
+        else:
+            return cert_name, conn
+        await self._refuse(conn, reason)
+        # Not seated, so there's no player id to file it under.
+        await self._inbox.put((None, {"type": "_rejected", "reason": reason}))
+        return None
 
     async def _serve_seat(self, player_id: str, conn: Connection, welcome: bool = False) -> None:
         """Seat the connection, then pump its frames into the inbox until it ends."""
@@ -525,10 +635,13 @@ class Server:
         for listener in self._listeners:
             listener.close()                 # no new connections
         await asyncio.gather(*(conn.close() for conn in list(self._conns.values())))
-        for listener in self._listeners:
-            # Connections still in the HELLO handshake aren't in _conns yet;
-            # this hangs up on those too.
-            listener.close_clients()
+        # Connections still in the TLS/HELLO handshake aren't in _conns yet.
+        # Cancel their tasks: asyncio then closes each one cleanly. (Closing
+        # their transports from here instead hits a CPython quirk: a clean
+        # close mid-TLS-handshake makes start_tls() *return* -- with no
+        # transport -- instead of raising.)
+        for task in list(self._handshaking):
+            task.cancel()
         for listener in self._listeners:
             try:
                 # Returns once every connection handler (_serve_seat) has
@@ -590,14 +703,20 @@ class Client:
         host: str | None = None,
         port: int | None = None,
         player_id: str | None = None,
+        tls_dir: str = DEFAULT_TLS_DIR,
     ) -> None:
         """
         Connect to the moderator: over UNIX at socket_path, or, if port is
-        given, over TCP to host:port, claiming seat player_id.
+        given, over TCP + mutual TLS to host:port as player_id, using that
+        player's certificate and the CA from tls_dir.
 
         Retries briefly because players may be launched a moment before the
-        moderator is listening. Raises SeatRefused (TCP) if the moderator
-        turns the seat claim down; that is final, so it isn't retried.
+        moderator is listening. These are final and NOT retried:
+          SeatRefused                 (TCP) the moderator turned us down
+          ssl.SSLCertVerificationError  (TCP) the moderator's certificate
+                                      isn't from our CA, or doesn't name
+                                      `host` -- we may be talking to an
+                                      impostor
         """
         if port is None and socket_path is None:
             raise ValueError("need socket_path (UNIX) or port (TCP)")
@@ -608,7 +727,8 @@ class Client:
         while True:
             try:
                 if port is not None:
-                    self._conn = await self._open_tcp(host or DEFAULT_TCP_HOST, port, player_id)
+                    self._conn = await self._open_tcp(host or DEFAULT_TCP_HOST, port,
+                                                      player_id, tls_dir)
                 else:
                     reader, writer = await asyncio.open_unix_connection(socket_path)
                     self._conn = Connection(reader, writer)
@@ -620,10 +740,15 @@ class Client:
                     raise
                 await asyncio.sleep(0.2)
 
-    async def _open_tcp(self, host: str, port: int, player_id: str) -> Connection:
-        """TCP connect, then the HELLO -> WELCOME handshake. Returns the link."""
-        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port),
-                                                CONNECT_TIMEOUT)
+    async def _open_tcp(self, host: str, port: int, player_id: str, tls_dir: str) -> Connection:
+        """TCP connect + TLS handshake, then HELLO -> WELCOME. Returns the link."""
+        tls = _tls_context(player_id, tls_dir, server_side=False)
+        # server_hostname=host: check_hostname compares the address we
+        # dialled against the SANs in the moderator's certificate.
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=tls, server_hostname=host,
+                                    ssl_handshake_timeout=CONNECT_TIMEOUT),
+            CONNECT_TIMEOUT)
         _tune_tcp(writer)
         conn = Connection(reader, writer)
         try:
@@ -637,6 +762,17 @@ class Client:
             # Not a TimeoutError, so connect() doesn't retry: the moderator
             # IS there, it just didn't answer.
             raise ConnectionClosed(f"no WELCOME within {HELLO_TIMEOUT}s") from None
+        except ConnectionClosed as e:
+            conn.abort()
+            # Our side of the TLS handshake succeeded, then the moderator
+            # hung up before WELCOME. In TLS 1.3 the client's half of the
+            # handshake finishes BEFORE the server has checked the client's
+            # certificate, so this is what a rejected certificate looks like
+            # from here. The TLS alert that would say *why* never arrives:
+            # asyncio drops the connection without flushing it. The
+            # moderator's log has the reason (a _rejected event).
+            raise SeatRefused("the moderator hung up before WELCOME, most likely because "
+                              f"it rejected our certificate (see its log): {e}") from e
         except BaseException:
             conn.abort()  # don't leak the socket on any other failure
             raise

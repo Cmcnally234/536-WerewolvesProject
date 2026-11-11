@@ -98,3 +98,5 @@ fi
 echo
 echo "socket tree:"
 ls -la "$RUN_DIR"
+echo
+echo "for TCP + TLS games, also create the certificates: sudo ./make_certs.sh"

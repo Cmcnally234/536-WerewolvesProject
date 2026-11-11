@@ -4,8 +4,8 @@ test_commslib.py -- commslib's failure paths and the TCP handshake.
     python3 test_commslib.py
 
 In-process, no sudo. Each test runs a real Server, over UNIX sockets in a
-temp dir or over TCP on a free localhost port; the failure-path tests run
-on both. Misbehaving peers are played by raw asyncio connections (this
+temp dir or over TCP + TLS on a free localhost port (certificates from a
+throwaway PKI made by make_certs.sh); the failure-path tests run on both. Misbehaving peers are played by raw asyncio connections (this
 test, like perm_probe.py, is allowed to touch sockets directly: the point
 is to send bytes a well-behaved Client never would).
 """
@@ -14,15 +14,19 @@ import asyncio
 import json
 import os
 import socket
+import ssl
 import struct
 import tempfile
 import time
 
 import commslib
 from commslib import (Client, ConnectionClosed, SeatRefused, Server,
-                      player_socket_path)
+                      player_socket_path, tls_paths)
+from testnet import shared_pki
 
 SEATS = ["good", "bad"]
+# "mallory" has a certificate from the real CA but never gets a seat.
+PKI = shared_pki(["good", "bad", "p1", "p2", "p3", "mallory"])
 
 
 def frame(body: bytes) -> bytes:
@@ -34,6 +38,15 @@ async def read_frame(reader: asyncio.StreamReader) -> dict:
     return json.loads(await reader.readexactly(n))
 
 
+async def tls_open(port: int, cert_of: str):
+    """A hand-built TLS connection presenting `cert_of`'s certificate, no HELLO yet."""
+    ca, cert, key = tls_paths(cert_of, PKI)
+    ctx = ssl.create_default_context(cafile=ca)
+    ctx.load_cert_chain(cert, key)
+    return await asyncio.open_connection("127.0.0.1", port, ssl=ctx,
+                                         server_hostname="127.0.0.1")
+
+
 class Net:
     """One transport for one test: UNIX in a temp dir, or TCP on a free port."""
 
@@ -43,7 +56,7 @@ class Net:
     async def server(self, send_timeout: float = 1.0, seats=SEATS) -> Server:
         server = Server(send_timeout=send_timeout)
         if self.kind == "tcp":
-            await server.start(seats, port=0)   # 0 = let the kernel pick
+            await server.start(seats, port=0, tls_dir=PKI)   # 0 = let the kernel pick
             self.port = server.port
         else:
             for seat in seats:
@@ -54,16 +67,17 @@ class Net:
     async def client(self, seat: str, retry_seconds: float = 2.0) -> Client:
         client = Client()
         if self.kind == "tcp":
-            await client.connect(port=self.port, player_id=seat, retry_seconds=retry_seconds)
+            await client.connect(port=self.port, player_id=seat, tls_dir=PKI,
+                                 retry_seconds=retry_seconds)
         else:
             await client.connect(player_socket_path(seat, self.tmp), retry_seconds=retry_seconds)
         return client
 
     async def raw(self, seat: str):
-        """A raw connection already sitting in `seat` (HELLO done for TCP)."""
+        """A raw connection already sitting in `seat` (TLS + HELLO done for TCP)."""
         if self.kind == "unix":
             return await asyncio.open_unix_connection(player_socket_path(seat, self.tmp))
-        r, w = await asyncio.open_connection("127.0.0.1", self.port)
+        r, w = await tls_open(self.port, seat)
         w.write(frame(json.dumps({"type": "HELLO", "player": seat}).encode()))
         assert (await read_frame(r))["type"] == "WELCOME"
         return r, w
@@ -233,7 +247,7 @@ async def test_close_with_stuck_peer(kind: str):
 # ---------------------------------------------------------------------------
 
 async def test_tcp_star():
-    """Over one TCP port: seats by HELLO, then 1:1, multicast and broadcast."""
+    """Over one TLS port: seats by certificate, then 1:1, multicast and broadcast."""
     seats = ["p1", "p2", "p3"]
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
         net = Net("tcp", tmp)
@@ -255,10 +269,12 @@ async def test_tcp_star():
             got[p] = [(await c.recv(timeout=2))["type"] for _ in range(2)]
         assert got == {"p1": ["SOME", "ALL"], "p2": ["ONE", "ALL"], "p3": ["SOME", "ALL"]}, got
 
+        cipher = server._conns["p1"]._writer.get_extra_info("cipher")
         for c in clients.values():
             await c.close()
         await server.close()
-    print(f"PASS [tcp] 3 players on one port: seat from HELLO, 1:1/multicast/broadcast {got}")
+    print(f"PASS [tcp] 3 players on one port ({cipher[1]}, {cipher[0]}), "
+          f"1:1/multicast/broadcast {got}")
 
 
 async def test_tcp_socket_options():
@@ -294,19 +310,31 @@ async def test_tcp_socket_options():
 
 
 async def test_tcp_refusals():
-    """Unknown seat, taken seat, wrong first frame, silent peer -- all turned away."""
+    """Certificate for no seat, HELLO for someone else's seat, taken seat, wrong
+    first frame, silent peers -- all turned away without taking a seat."""
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
         net = Net("tcp", tmp)
         server = await net.server()
 
         try:
             await net.client("mallory")
-            raise AssertionError("unknown seat was accepted")
+            raise AssertionError("certificate for no seat was accepted")
         except SeatRefused as e:
             refusal = str(e)
-        assert "no seat named 'mallory'" in refusal, refusal
+        assert "which is not a seat" in refusal, refusal
         ev = await next_event(server, None, "_rejected")
-        print(f"PASS [tcp] unknown seat refused: client got {refusal!r}, server got {ev}")
+        print(f"PASS [tcp] cert for no seat refused: client got {refusal!r}, server got {ev}")
+
+        # good's (valid) certificate, but a HELLO claiming bad's seat.
+        r, w = await tls_open(net.port, cert_of="good")
+        w.write(frame(json.dumps({"type": "HELLO", "player": "bad"}).encode()))
+        reply = await read_frame(r)
+        assert reply == {"type": "error",
+                         "text": "certificate is for 'good', not 'bad'"}, reply
+        assert await r.read() == b""
+        w.close()
+        assert server.connected() == []
+        print(f"PASS [tcp] HELLO for another player's seat refused: {reply}")
 
         first = await net.client("good")
         try:
@@ -321,7 +349,7 @@ async def test_tcp_refusals():
         assert (await first.recv(timeout=2))["type"] == "STILL_HERE"
         print(f"PASS [tcp] duplicate seat refused ({refusal!r}); first occupant unaffected")
 
-        r, w = await asyncio.open_connection("127.0.0.1", net.port)
+        r, w = await tls_open(net.port, cert_of="bad")
         w.write(frame(json.dumps({"type": "VOTE", "target": "good"}).encode()))
         reply = await read_frame(r)
         assert reply == {"type": "error", "text": "expected HELLO first"}, reply
@@ -329,18 +357,27 @@ async def test_tcp_refusals():
         w.close()
         print(f"PASS [tcp] non-HELLO first frame refused: {reply}")
 
-        # A peer that connects and says nothing is dropped after HELLO_TIMEOUT.
+        # Peers that go quiet are dropped after HELLO_TIMEOUT: one that never
+        # starts TLS, and one that finishes TLS but never sends HELLO.
         saved, commslib.HELLO_TIMEOUT = commslib.HELLO_TIMEOUT, 0.5
         try:
-            r, w = await asyncio.open_connection("127.0.0.1", net.port)
-            start = time.monotonic()
-            assert await asyncio.wait_for(r.read(), 3) == b""
-            elapsed = time.monotonic() - start
+            for what, opener in [("before TLS", lambda: asyncio.open_connection("127.0.0.1", net.port)),
+                                 ("after TLS", lambda: tls_open(net.port, cert_of="bad"))]:
+                r, w = await opener()
+                start = time.monotonic()
+                try:
+                    data = await asyncio.wait_for(r.read(), 3)
+                except (ssl.SSLError, ConnectionError):
+                    data = b""
+                elapsed = time.monotonic() - start
+                assert data == b"", data
+                w.close()
+                assert "bad" not in server.connected()
+                print(f"PASS [tcp] peer silent {what} dropped after {elapsed:.1f}s, no seat taken")
         finally:
             commslib.HELLO_TIMEOUT = saved
-        w.close()
-        assert "bad" not in server.connected()
-        print(f"PASS [tcp] silent peer dropped after {elapsed:.1f}s without taking a seat")
+        ev = await next_event(server, None, "_rejected")
+        assert "TLS handshake failed" in ev["reason"], ev
 
         await first.close()
         await server.close()
@@ -357,19 +394,19 @@ async def test_tcp_connect_retry_and_close():
     async def late_server():
         await asyncio.sleep(0.6)
         server = Server()
-        await server.start(SEATS, port=free)
+        await server.start(SEATS, port=free, tls_dir=PKI)
         return server
 
     server_task = asyncio.create_task(late_server())
     client = Client()
     start = time.monotonic()
-    await client.connect(port=free, player_id="good", retry_seconds=5)
+    await client.connect(port=free, player_id="good", tls_dir=PKI, retry_seconds=5)
     waited = time.monotonic() - start
     server = await server_task
     assert waited >= 0.5, waited
     print(f"PASS [tcp] player started first connected after retrying {waited:.1f}s")
 
-    r, w = await asyncio.open_connection("127.0.0.1", free)   # never says HELLO
+    r, w = await asyncio.open_connection("127.0.0.1", free)   # never starts TLS
     await asyncio.sleep(0.1)
     start = time.monotonic()
     await client.close()
@@ -381,10 +418,16 @@ async def test_tcp_connect_retry_and_close():
     print(f"PASS [tcp] close() with a peer mid-handshake took {elapsed:.2f}s")
 
     try:
-        await Server().start(SEATS, check_peer_uid=True, port=0)
+        await Server().start(SEATS, check_peer_uid=True, port=0, tls_dir=PKI)
         raise AssertionError("check_peer_uid accepted over TCP")
     except ValueError as e:
         print(f"PASS [tcp] check_peer_uid refused: {e}")
+
+    try:
+        await Server().start(SEATS, port=0, tls_dir=os.path.join(PKI, "nope"))
+        raise AssertionError("started without TLS files")
+    except OSError as e:
+        print(f"PASS [tcp] missing TLS files fail at start(): {e}")
 
 
 async def main():

@@ -5,7 +5,8 @@
 #   sudo N_PLAYERS=4 ./teardown_users.sh
 #
 # Kills any processes still running as the game users, then deletes the
-# users, their groups, /run/werewolf and /opt/werewolf. Safe to re-run.
+# users, their groups, /run/werewolf, /opt/werewolf and /etc/werewolf (the
+# TLS certificates from make_certs.sh). Safe to re-run.
 
 set -euo pipefail
 
@@ -42,5 +43,5 @@ if getent group "$GAME_GROUP" >/dev/null; then
     echo "removed group $GAME_GROUP"
 fi
 
-rm -rf /run/werewolf /opt/werewolf
-echo "removed /run/werewolf and /opt/werewolf"
+rm -rf /run/werewolf /opt/werewolf /etc/werewolf
+echo "removed /run/werewolf, /opt/werewolf and /etc/werewolf"
