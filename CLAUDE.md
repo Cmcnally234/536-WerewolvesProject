@@ -31,10 +31,10 @@ Python 3.14, Fedora (SELinux enforcing). Standard library only.
 | `test_no_role_leak.py` | Full 6-player bot games; asserts villagers never receive role info outside `GAME_OVER`. Includes a self-test proving the checker can fail. |
 | `test_night.py` | Night phase: early finish, a silent Seer gets a no-op, everyone silent, the Doctor no-repeat rule. |
 | `test_day.py` | In-process `FakeServer` tests (majority, tie, timeout, spectators, early vote, self-vote) plus one real-process live chat relay test. |
-| `test_commslib.py` | In-process commslib tests. Failure paths on UNIX **and** TCP: malformed / non-dict / non-UTF-8 / oversized frames, `send_to` timeout on a stuck reader, `close()` with a stuck peer. Client sentinel on garbage and on a reader bug. TCP: star over one port, socket options on both ends, refusals (unknown seat, taken seat, non-HELLO, silent peer), connect retry, close mid-handshake. |
+| `test_commslib.py` | In-process commslib tests. Failure paths on UNIX **and** TCP: malformed / non-dict / non-UTF-8 / oversized frames, `send_to` timeout on a stuck reader, `close()` with a stuck peer. Client sentinel on garbage and on a reader bug. TCP: star over one port, socket options on both ends, refusals (unknown seat, taken seat, non-HELLO, silent peer), connect retry, close mid-handshake. Heartbeats: idle link kept, silent player/moderator dropped, `BlackHoleProxy` (both ends notice), peer's interval respected, bad intervals rejected. |
 | `testnet.py` | `WW_TRANSPORT=unix|tcp` (default unix) → `net_args(sock_dir)` gives the moderator/player flags; for tcp it adds `--tls` with a per-process PKI from `shared_pki()` (seats p1..p6). Used by the four process-launching tests and `test_commslib.py`. |
 | `DISTRIBUTED.md` | Project 2 protocol doc: transports, handshake, socket options, failure model; later stages fill in heartbeat / seq-ack / resume. Keep in sync with commslib. |
-| `test_game.py` | Whole games (winner matches the rules, everyone exits 0, no socket files left), SIGTERM/SIGINT to the moderator, SIGTERM to a player mid-game. |
+| `test_game.py` | Whole games (winner matches the rules, everyone exits 0, no socket files left), SIGTERM/SIGINT to the moderator, SIGTERM to a player mid-game, SIGSTOP to a player (heartbeat drops it within the limit). `Run` timestamps moderator output lines (`wait_for_log`). |
 | `README.md` | Grader-facing (someone else runs this on another machine): commslib name/location callout at the top, requirements, setup, "no compilation needed", how to play, the full **commslib API reference** (with a tested example), file list, testing guide, troubleshooting, uninstall. Keep it in sync when the API or flags change. |
 | `run_game.sh` | Launches one game as real users: the moderator (foreground, as modbot) and the bot seats (background, `setsid sudo -u playerN`). Prints the command for each human seat. Refuses stale `/opt/werewolf` code. |
 | `ARCHITECTURE.md` | Writeup material: topology diagram, commslib/framing, permissions, message table, concurrency, rules, tests, limitations. |
@@ -93,6 +93,7 @@ Exit status = the moderator's (0 finished, 1 aborted or nobody joined). Logs go 
   - `--discussion` (60)
   - `--vote-timeout` (30)
   - `--max-rounds` (20; a draw after that many rounds)
+  - `--heartbeat` (2) / `--heartbeat-misses` (3)
   - `--local`
 - **player.py**:
   - `--dir`
@@ -100,6 +101,7 @@ Exit status = the moderator's (0 finished, 1 aborted or nobody joined). Logs go 
   - `--bot [act|silent]` (no keyboard)
   - `--log FILE` (append every received message as JSON lines; used by the tests)
   - `--wait` (connect retry seconds, 30)
+  - `--heartbeat` (2) / `--heartbeat-misses` (3)
 
 In-game commands: `/kill`, `/peek` or `/heal <name|number>`; `/w <msg>` (wolf whisper, night only); `/vote <name|number|none>`; `/role`; `/help`; `/quit`. Any line without a leading `/` is day chat.
 
@@ -130,6 +132,8 @@ TCP + TLS by hand: `./make_certs.sh -o /tmp/pki p1 p2 p3 p4 p5`, then add `--por
 - **SO_PEERCRED** (`--peercred`): the kernel-reported uid of the connecting process must match `pwd.getpwnam(player_id)`. This catches modbot and root, which can get past the file permissions. With `--peercred`, player ids must be real usernames, so don't use it with `p1..p5` in local mode.
 - **SELinux:** processes started with `sudo -u` from a shell run as `unconfined_t`, so no denials are expected. If something is blocked: `sudo ausearch -m AVC,USER_AVC -ts recent`, `ls -Z /opt/werewolf /run/werewolf` (expect `usr_t` / `var_run_t`), `sudo restorecon -Rv ...`. A SELinux denial looks identical to a normal EACCES. The warning sign is player1 being denied its *own* socket.
 - **TLS rejections look like a hang-up to the player.** asyncio force-closes a failed TLS handshake without flushing the alert, so `Client.connect()` raises `SeatRefused("the moderator hung up before WELCOME...")`; the precise reason is only in the moderator's `_rejected` log line. `test_tls.sh` checks those reasons in the server log for that reason.
+- **Heartbeats change Project 1 behaviour:** a player suspended (Ctrl-Z) for more than ~6s is now dropped. Use `--heartbeat`/`--heartbeat-misses` to loosen it.
+- **`pkill -f <pattern>` can kill your own shell** if the pattern appears in the command line running it; use a script or exact PIDs.
 - **Don't close transports mid-TLS-handshake.** A clean close makes `start_tls()` return with a `None` transport instead of raising (CPython quirk). `Server.close()` cancels the `_handshaking` tasks instead.
 - In this dev shell, `ls` is aliased to a different tool. Use `/usr/bin/ls` when exit codes or exact output matter.
 
@@ -160,6 +164,7 @@ TCP + TLS by hand: `./make_certs.sh -o /tmp/pki p1 p2 p3 p4 p5`, then add `--por
 - **A reader task per connection feeding one queue.** commslib's `Server` runs a `_serve_player` task per connection, and they all push into one inbox; `recv_any(timeout)` = `wait_for(inbox.get())`. `Client` uses the same pattern so a timeout can never cancel a half-read frame, which would desync the stream.
 - **One socket per seat (UNIX).** The moderator knows who a connection belongs to from *which socket it arrived on*, which file permissions enforce; it doesn't trust message contents for identity.
 - **Seat = certificate CN (TCP).** The moderator runs `start_tls()` itself in `_handshake_tcp` (so failures become `_rejected`), takes the seat from the verified peer cert, and only *checks* the HELLO's `player` against it. Both sides trust only `ca.crt`; TLS 1.3 minimum; the player verifies the moderator's SAN against `--host`. No plaintext TCP mode.
+- **Heartbeats** (`Connection.heartbeat`, one task per link on both sides, both transports): `HEARTBEAT {interval}` sent at once then every interval; `recv()` swallows them and stamps `last_heard` on every frame; silence ≥ misses × *peer's announced* interval → `abort(reason)` → the normal reader/`_disconnected` path. Interval belongs to the sender, misses to the detector. `abort(reason)` makes the reader report that reason instead of "peer closed".
 - **Lobby** (`moderator.lobby()`) reads the inbox itself rather than `wait_for_players`, so joins and rejections are logged as they happen; it tracks joins from events, not `server.connected()` (which runs ahead of the inbox).
 - **`Game.message_loop(seconds, handle, is_done)`** is the one concurrency loop. It gives each phase a single overall deadline; each `recv_any` waits only for the time remaining. Night and vote end early when nobody is pending; discussion always runs its full time.
 - **Night timeout:** anyone still pending at the deadline gets a no-op and an `INFO` "time's up". The game continues.

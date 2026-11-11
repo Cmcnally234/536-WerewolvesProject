@@ -31,7 +31,8 @@ receiver exactly how many bytes make up the next message.
 
 Inbox event types the Server generates itself (prefixed with "_"):
     _connected     a player took its seat
-    _disconnected  a player's connection closed ("reason" says why)
+    _disconnected  a player's connection closed ("reason" says why, e.g.
+                   "no heartbeat for 6.0s (limit 3 x 2s)")
     _rejected      a connection was turned away ("reason" says why): wrong
                    uid (SO_PEERCRED), seat already taken, or (TCP) a failed
                    TLS handshake / a certificate or HELLO naming no seat or
@@ -54,6 +55,7 @@ import pwd
 import socket
 import ssl
 import struct
+import time
 
 # ">I" = big-endian ("network order") unsigned 32-bit int -> the length prefix.
 _HEADER = struct.Struct(">I")
@@ -95,6 +97,18 @@ MAX_MESSAGE_BYTES = 1024 * 1024
 # reading; once its kernel buffer fills, drain() would wait forever and --
 # because broadcast() waits for every send -- freeze the whole game with it.
 DEFAULT_SEND_TIMEOUT = 5.0
+
+# Application-level heartbeats (Connection.heartbeat). Both ends send one
+# every HEARTBEAT_INTERVAL seconds; an end that hears NOTHING from its peer
+# for HEARTBEAT_MISSES of the peer's intervals declares it dead. 2s x 3:
+# a dead player is noticed within ~6s, well inside any game phase, while a
+# couple of seconds of jitter or a slow frame never trips it.
+HEARTBEAT = "HEARTBEAT"             # wire type; consumed by commslib, never delivered
+DEFAULT_HEARTBEAT_INTERVAL = 2.0
+DEFAULT_HEARTBEAT_MISSES = 3
+# Cap on the interval a peer may announce, so "bounded time" stays bounded
+# even if a peer is misconfigured (it's authenticated, not trusted blindly).
+MAX_HEARTBEAT_INTERVAL = 60.0
 
 # How long close() waits for buffered bytes to flush before hard-aborting.
 # A graceful close waits until the peer has read everything we queued, which
@@ -200,6 +214,13 @@ def _tune_tcp(writer: asyncio.StreamWriter) -> None:
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, TCP_USER_TIMEOUT_MS)
 
 
+def _check_heartbeat(interval: float, misses: int) -> None:
+    if not 0 < interval <= MAX_HEARTBEAT_INTERVAL:
+        raise ValueError(f"heartbeat interval must be in (0, {MAX_HEARTBEAT_INTERVAL}]")
+    if misses < 1:
+        raise ValueError("heartbeat misses must be at least 1")
+
+
 class ConnectionClosed(ConnectionError):
     """
     The link is gone (peer hung up, reset, timed out or broke the protocol).
@@ -230,7 +251,13 @@ class ProtocolError(ConnectionClosed):
 # ---------------------------------------------------------------------------
 
 class Connection:
-    """A single framed link. Wraps asyncio's StreamReader/StreamWriter."""
+    """
+    A single framed link. Wraps asyncio's StreamReader/StreamWriter.
+
+    Also does liveness (see heartbeat()): recv() swallows the peer's
+    HEARTBEAT frames, and every frame received -- heartbeat or not --
+    counts as proof that the peer is alive.
+    """
 
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         self._reader = reader
@@ -240,6 +267,13 @@ class Connection:
         # (header + body); the lock guarantees they are never interleaved
         # with another message's bytes on the wire.
         self._send_lock = asyncio.Lock()
+        # Liveness bookkeeping. time.monotonic() is the clock asyncio's own
+        # loop.time() uses; it never jumps when the wall clock is changed.
+        self.last_heard = time.monotonic()
+        self.peer_interval: float | None = None   # from the peer's HEARTBEATs
+        # Why WE killed the link, if we did. recv() reports this instead of
+        # the generic "peer closed the connection" it would otherwise see.
+        self._abort_reason: str | None = None
 
     async def send(self, msg: dict) -> None:
         if not isinstance(msg, dict):
@@ -254,6 +288,20 @@ class Connection:
             await self._writer.drain()
 
     async def recv(self) -> dict:
+        """The next frame that isn't a HEARTBEAT."""
+        while True:
+            msg = await self._recv_frame()
+            self.last_heard = time.monotonic()
+            if msg.get("type") != HEARTBEAT:
+                return msg
+            interval = msg.get("interval")
+            # bool is an int subclass, so `True` would otherwise pass as 1.
+            if (isinstance(interval, bool) or not isinstance(interval, (int, float))
+                    or not 0 < interval <= MAX_HEARTBEAT_INTERVAL):
+                raise ProtocolError(f"bad heartbeat interval {interval!r}")
+            self.peer_interval = float(interval)
+
+    async def _recv_frame(self) -> dict:
         try:
             # readexactly() keeps reading until it has exactly n bytes, which
             # is precisely what framing needs: first the 4-byte header, then
@@ -267,11 +315,11 @@ class Connection:
             raise  # our own oversized-frame error; it's an OSError too
         except asyncio.IncompleteReadError as e:
             # EOF arrived mid-message (or before one).
-            raise ConnectionClosed("peer closed the connection") from e
+            raise ConnectionClosed(self._abort_reason or "peer closed the connection") from e
         except OSError as e:
-            # Resets, broken pipes, and (later) TCP/TLS errors -- ssl.SSLError
-            # is an OSError too. All mean the same thing to the caller.
-            raise ConnectionClosed(f"connection error: {e!r}") from e
+            # Resets, broken pipes, TCP/TLS errors -- ssl.SSLError is an
+            # OSError too. All mean the same thing to the caller.
+            raise ConnectionClosed(self._abort_reason or f"connection error: {e!r}") from e
 
         # The frame boundary is intact here, but the contents still come from
         # the peer and may be garbage. Without these checks a bad body would
@@ -286,8 +334,60 @@ class Connection:
             raise ProtocolError(f"peer sent a {type(msg).__name__}, not an object")
         return msg
 
-    def abort(self) -> None:
+    async def heartbeat(self, interval: float, misses: int) -> None:
+        """
+        Run for the life of the link (as its own task): send a HEARTBEAT
+        every `interval` seconds, and abort the link if the peer goes silent
+        for `misses` of ITS heartbeat intervals.
+
+        Why at the application level, when TCP has keepalive? Keepalive is
+        answered by the peer's KERNEL: a frozen or deadlocked process still
+        "answers". And a middlebox that accepts our packets but never
+        delivers them (or a silently dropping network, with TCP_USER_TIMEOUT
+        not yet expired) looks fine from the socket's point of view. Only
+        the far-end *program* producing frames proves it's alive.
+
+        Detection is bounded: a peer is declared dead at most
+        misses * peer_interval seconds after the last frame we got from it.
+
+        The interval belongs to the SENDER (it's announced in each heartbeat)
+        and the miss limit to the DETECTOR, so two ends configured
+        differently still agree on when a heartbeat is late.
+        """
+        next_send = time.monotonic()   # the first heartbeat goes out at once
+        while True:
+            now = time.monotonic()
+            # Until the peer's first heartbeat tells us its interval, assume
+            # it uses ours.
+            peer_interval = self.peer_interval or interval
+            limit = misses * peer_interval
+            silent = now - self.last_heard
+            if silent >= limit:
+                self.abort(f"no heartbeat for {silent:.1f}s "
+                           f"(limit {misses} x {peer_interval:g}s)")
+                return
+            if now >= next_send:
+                try:
+                    # Bounded like every other send. If it times out, the frame
+                    # is still queued (see Server.send_to), and the silence
+                    # check above decides whether the peer is gone.
+                    await asyncio.wait_for(
+                        self.send({"type": HEARTBEAT, "interval": interval}), interval)
+                except TimeoutError:
+                    pass
+                except ConnectionError:
+                    return   # the link is already gone; the reader reports it
+                next_send = now + interval
+            # Sleep until the next thing that can happen: our next send, or
+            # the moment the peer would be overdue. If a frame arrives in the
+            # meantime, last_heard moves and the next pass just sleeps again.
+            wake = min(next_send, self.last_heard + limit)
+            await asyncio.sleep(max(wake - time.monotonic(), 0))
+
+    def abort(self, reason: str | None = None) -> None:
         """Drop the link immediately, discarding anything still buffered."""
+        if reason and self._abort_reason is None:
+            self._abort_reason = reason
         self._writer.transport.abort()
 
     async def close(self) -> None:
@@ -322,8 +422,13 @@ class Server:
     to await recv_any() -- it never blocks on any single player.
     """
 
-    def __init__(self, send_timeout: float = DEFAULT_SEND_TIMEOUT):
+    def __init__(self, send_timeout: float = DEFAULT_SEND_TIMEOUT,
+                 heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
+                 heartbeat_misses: int = DEFAULT_HEARTBEAT_MISSES):
+        _check_heartbeat(heartbeat_interval, heartbeat_misses)
         self.send_timeout = send_timeout
+        self.heartbeat_interval = heartbeat_interval
+        self.heartbeat_misses = heartbeat_misses
         self.port: int | None = None      # TCP: the port actually bound
         self._tls: ssl.SSLContext | None = None
         self._handshaking: set[asyncio.Task] = set()   # TCP: not seated yet
@@ -520,6 +625,7 @@ class Server:
         self._conns[player_id] = conn
 
         reason = "closed"
+        heartbeat = None
         try:
             if welcome:
                 # TCP only: tells the client its HELLO was accepted. Sent
@@ -527,6 +633,12 @@ class Server:
                 # first frame the client sees.
                 await asyncio.wait_for(conn.send({"type": "WELCOME", "player": player_id}),
                                        self.send_timeout)
+            # Runs beside this reader loop. If the player goes silent, it
+            # aborts the link, conn.recv() below raises with its reason, and
+            # the finally block posts _disconnected -- the one path every
+            # kind of disconnect takes.
+            heartbeat = asyncio.create_task(
+                conn.heartbeat(self.heartbeat_interval, self.heartbeat_misses))
             await self._inbox.put((player_id, {"type": "_connected"}))
             if len(self._conns) == len(self._seats):
                 self._all_connected.set()
@@ -552,6 +664,9 @@ class Server:
                 del self._conns[player_id]
             self._inbox.put_nowait((player_id, {"type": "_disconnected", "reason": reason}))
             await conn.close()
+            if heartbeat is not None:
+                heartbeat.cancel()
+                await asyncio.gather(heartbeat, return_exceptions=True)
 
     async def _refuse(self, conn: Connection, text: str) -> None:
         """Best-effort error message, then hang up. Never raises."""
@@ -591,10 +706,9 @@ class Server:
             # memory behind this one. Hang up instead: the reader task sees
             # the link drop and posts _disconnected, so the game learns about
             # it the same way as any other disconnect.
-            conn.abort()
-            raise ConnectionClosed(
-                f"{player_id} stopped reading (send timed out after {self.send_timeout}s)"
-            ) from None
+            reason = f"{player_id} stopped reading (send timed out after {self.send_timeout}s)"
+            conn.abort(reason)
+            raise ConnectionClosed(reason) from None
 
     async def multicast(self, player_ids, msg: dict) -> list[str]:
         """
@@ -672,10 +786,15 @@ class Client:
     queue.get() is always safe because frames enter the queue whole.
     """
 
-    def __init__(self):
+    def __init__(self, heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
+                 heartbeat_misses: int = DEFAULT_HEARTBEAT_MISSES):
+        _check_heartbeat(heartbeat_interval, heartbeat_misses)
+        self.heartbeat_interval = heartbeat_interval
+        self.heartbeat_misses = heartbeat_misses
         self._conn: Connection | None = None
         self._inbox: asyncio.Queue = asyncio.Queue()
         self._reader_task: asyncio.Task | None = None
+        self._heartbeat_task: asyncio.Task | None = None
         self._closed_reason = "moderator closed the connection"
 
     async def _read_loop(self) -> None:
@@ -733,6 +852,11 @@ class Client:
                     reader, writer = await asyncio.open_unix_connection(socket_path)
                     self._conn = Connection(reader, writer)
                 self._reader_task = asyncio.create_task(self._read_loop())
+                # The player watches the moderator too: if it goes silent,
+                # the link is aborted and recv() raises ConnectionClosed with
+                # the reason, instead of the player waiting forever.
+                self._heartbeat_task = asyncio.create_task(
+                    self._conn.heartbeat(self.heartbeat_interval, self.heartbeat_misses))
                 return
             except (FileNotFoundError, ConnectionRefusedError, TimeoutError):
                 # Nothing listening (yet), or the connect timed out.
@@ -797,10 +921,11 @@ class Client:
         return msg
 
     async def close(self) -> None:
-        if self._reader_task is not None:
-            self._reader_task.cancel()
-            # Wait for the cancellation to finish so the task isn't left
-            # dangling ("Task was destroyed but it is pending!").
-            await asyncio.gather(self._reader_task, return_exceptions=True)
+        tasks = [t for t in (self._reader_task, self._heartbeat_task) if t is not None]
+        for task in tasks:
+            task.cancel()
+        # Wait for the cancellations to finish so no task is left dangling
+        # ("Task was destroyed but it is pending!").
+        await asyncio.gather(*tasks, return_exceptions=True)
         if self._conn is not None:
             await self._conn.close()

@@ -9,6 +9,7 @@ Real processes (moderator + bot players, no sudo). Checks that:
   - all socket files are gone afterwards
   - SIGTERM / Ctrl-C on the moderator still ends the game cleanly
   - a player killed mid-game doesn't break anything for the others
+  - a player frozen mid-game (SIGSTOP) is dropped by heartbeat within the limit
 """
 
 import json
@@ -17,6 +18,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 import roles
@@ -29,7 +31,7 @@ FAST = ["--night-timeout", "5", "--discussion", "0.5", "--vote-timeout", "3"]
 class Run:
     """One moderator + N bot players in a temp dir."""
 
-    def __init__(self, tmp, players, seed, extra=(), modes=None):
+    def __init__(self, tmp, players, seed, extra=(), modes=None, player_extra=()):
         self.players = players
         self.sock_dir = os.path.join(tmp, "s")
         self.logs = {p: os.path.join(tmp, f"{p}.jsonl") for p in players}
@@ -40,9 +42,31 @@ class Run:
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         self.procs = {p: subprocess.Popen(
             [sys.executable, os.path.join(HERE, "player.py"), p, *player_net,
-             "--bot", (modes or {}).get(p, "act"), "--log", self.logs[p]],
+             "--bot", (modes or {}).get(p, "act"), "--log", self.logs[p], *player_extra],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
             for p in players}
+        # Read the moderator's output as it arrives, stamping each line, so a
+        # test can ask WHEN something was logged (see wait_for_log).
+        self.mod_lines: list[tuple[float, str]] = []
+        self._reader = threading.Thread(target=self._read_mod, daemon=True)
+        self._reader.start()
+
+    def _read_mod(self):
+        for line in self.mod.stdout:
+            self.mod_lines.append((time.monotonic(), line))
+
+    def wait_for_log(self, text: str, timeout=10) -> float:
+        """Block until the moderator logs a line containing `text`; return its time."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            for stamp, line in list(self.mod_lines):
+                if text in line:
+                    return stamp
+            time.sleep(0.05)
+        raise AssertionError(f"moderator never logged {text!r}:\n" + self.mod_out())
+
+    def mod_out(self) -> str:
+        return "".join(line for _, line in self.mod_lines)
 
     def wait_for(self, kind: str, who: str, timeout=10):
         """Block until player `who` has logged a message of type `kind`."""
@@ -54,7 +78,9 @@ class Run:
         raise AssertionError(f"{who} never got {kind}")
 
     def finish(self, timeout=120):
-        out, _ = self.mod.communicate(timeout=timeout)
+        self.mod.wait(timeout=timeout)
+        self._reader.join(timeout=5)
+        out = self.mod_out()
         codes = {}
         for p, proc in self.procs.items():
             _, err = proc.communicate(timeout=10)
@@ -149,10 +175,46 @@ def test_player_killed_midgame():
           f"'{received[others[0]][-1]['text']}'")
 
 
+def test_player_frozen_midgame():
+    """
+    SIGSTOP freezes p3's process but not its kernel: the TCP connection stays
+    up, keepalive probes are answered, nothing is ever reset. Only the
+    missing heartbeats show that the program is gone.
+    """
+    players = [f"p{i}" for i in range(1, 7)]
+    beat, misses = 0.5, 3
+    limit = beat * misses
+    with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
+        run = Run(tmp, players, 1, FAST + ["--heartbeat", str(beat)],
+                  player_extra=["--heartbeat", str(beat), "--heartbeat-misses", str(misses)])
+        run.wait_for("PHASE", "p3")
+        run.procs["p3"].send_signal(signal.SIGSTOP)
+        frozen_at = time.monotonic()
+        dropped_at = run.wait_for_log("p3 disconnected")
+        run.procs["p3"].send_signal(signal.SIGCONT)
+        out, codes, received = run.finish()
+
+    detected = dropped_at - frozen_at
+    line = next(l for l in out.splitlines() if "p3 disconnected" in l)
+    assert run.mod.returncode == 0, out
+    assert "no heartbeat" in line, line
+    # The heartbeat bound, plus a little for process scheduling.
+    assert detected < limit + 0.5, f"took {detected:.2f}s to notice (limit {limit}s)"
+    others = [p for p in players if p != "p3"]
+    for p in others:
+        assert received[p][-1]["type"] == "GAME_OVER", f"{p} never saw the end"
+    # Thawed, p3 finds its link already dropped and exits cleanly by itself.
+    assert codes["p3"][0] == 0, f"p3 exited {codes['p3']}"
+    print(f"PASS player p3 frozen (SIGSTOP) mid-game: dropped after {detected:.2f}s "
+          f"(limit {limit}s), logged as '{line.split('] ', 1)[1]}'; the game finished; "
+          f"thawed p3 exited 0")
+
+
 if __name__ == "__main__":
     test_winner_rules()
     test_full_games()
     test_moderator_signal(signal.SIGTERM, "SIGTERM")
     test_moderator_signal(signal.SIGINT, "SIGINT (Ctrl-C)")
     test_player_killed_midgame()
+    test_player_frozen_midgame()
     print("all game tests passed")

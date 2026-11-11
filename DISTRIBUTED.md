@@ -2,7 +2,7 @@
 
 This document describes the wire protocol between the moderator and the players once they run on different machines. It grows with each stage; sections for later stages are marked *not yet implemented*.
 
-All networking lives in `commslib.py`. `moderator.py` and `player.py` see the same API as in Project 1. The only differences are three keyword arguments (`host`, `port`, `tls_dir`) and three command-line flags (`--host`, `--port`, `--tls`).
+All networking lives in `commslib.py`. `moderator.py` and `player.py` see the same API as in Project 1. The only differences are a few keyword arguments (`host`, `port`, `tls_dir`; `heartbeat_interval` and `heartbeat_misses` on the `Server`/`Client` constructors) and the matching command-line flags (`--host`, `--port`, `--tls`, `--heartbeat`, `--heartbeat-misses`).
 
 ## Transports
 
@@ -92,7 +92,7 @@ So an impostor moderator can't collect votes or whispers. `test_tls.sh` checks a
 | `TCP_USER_TIMEOUT` | 30 s | Keepalive doesn't probe while we have *unacked data in flight*. TCP then retransmits instead, for ~15 minutes by default. This caps that: data unacked for 30 s kills the link. |
 | `SO_REUSEADDR` (listener) | on | Restarting the moderator right after a game would otherwise fail with "Address already in use" while old connections sit in `TIME_WAIT`. |
 
-These are kernel-level and coarse. Stage 3 adds application heartbeats, which also catch a peer whose kernel is alive but whose process is hung.
+These are kernel-level and coarse. The application heartbeats below catch the cases they can't.
 
 ## Failure model (so far)
 
@@ -102,9 +102,11 @@ These are kernel-level and coarse. Stage 3 adds application heartbeats, which al
 |---|---|---|
 | Peer closes or resets | `recv()` gets EOF or `ECONNRESET` | `_disconnected` (moderator) / `ConnectionClosed` (player) |
 | Peer sends a bad frame | `Connection.recv` | `ProtocolError`; that link is dropped; other players are unaffected |
-| Player stops reading (process stopped or wedged) | `Server.send_to` times out after `send_timeout` (5 s) | Link aborted, `_disconnected`; a `broadcast` is delayed by at most 5 s |
-| Peer's host vanishes, link idle | TCP keepalive | Link reset after ~25 s, then `_disconnected` |
-| Peer's host vanishes, data in flight | `TCP_USER_TIMEOUT` | Link reset after ~30 s, then `_disconnected` |
+| Player stops reading while we send a lot | `Server.send_to` times out after `send_timeout` (5 s) | Link aborted, `_disconnected` (`... stopped reading ...`); a `broadcast` is delayed by at most 5 s |
+| Peer process frozen or hung (kernel still alive) | heartbeat | Link aborted after `misses × interval` (6 s), then `_disconnected` / `ConnectionClosed`, reason `no heartbeat ...` |
+| Network silently drops everything (partition, black-holing middlebox) | heartbeat, at both ends | Same: both sides give up within 6 s |
+| Peer's host vanishes | heartbeat (6 s); TCP keepalive (~25 s idle) and `TCP_USER_TIMEOUT` (30 s in flight) as backups | `_disconnected` / `ConnectionClosed` |
+| Moderator frozen or unreachable | each player's heartbeat | The player prints `Lost the connection to the moderator: no heartbeat ...` and exits (stage 4: reconnects instead) |
 | Connection that never finishes TLS or never says `HELLO` | `HELLO_TIMEOUT` (TLS: `ssl_handshake_timeout`) | Dropped after 5 s, never takes a seat |
 | Bad, missing, or foreign certificate; certificate for another seat | TLS handshake / seat check | Refused, `_rejected` with the reason (table above) |
 | Impostor moderator | the player's certificate and hostname check | `ssl.SSLCertVerificationError`; the player never sends a byte of game data |
@@ -113,7 +115,44 @@ These are kernel-level and coarse. Stage 3 adds application heartbeats, which al
 
 **What happens to the game on a disconnect** is unchanged from Project 1. The player stays alive and a timed phase treats them as silent. Stage 4 adds reconnecting.
 
-## Heartbeat (stage 3, *not yet implemented*)
+## Heartbeat
+
+```
+{"type": "HEARTBEAT", "interval": 2.0}      both directions, both transports
+```
+
+- **Both ends** send one as soon as the link is up (after `WELCOME` on TCP), then every `interval` seconds. They're sent unconditionally, not only when idle, which keeps the logic to one loop.
+- **The receiver's `Connection.recv()` swallows them,** so the game never sees one. `HEARTBEAT` is therefore a reserved message type.
+- **Any frame counts as a sign of life, heartbeat or game message.** Each received frame updates `Connection.last_heard`.
+- **Dead peer:** if nothing at all arrives for `misses × peer_interval` seconds, `Connection.heartbeat()` aborts the link with the reason `no heartbeat for 6.0s (limit 3 x 2s)`. The reader then fails with that reason:
+  - the moderator gets `_disconnected` with it;
+  - the player's `recv()` raises `ConnectionClosed` with it.
+
+  It's the same path as every other disconnect.
+
+**Who sets what:** the interval belongs to the **sender**, which announces it in every heartbeat (until the first one arrives, the receiver assumes its own). The miss limit belongs to the **detector**. So two ends configured differently still agree on when a heartbeat is late. For example, a player beating every 0.5 s isn't dropped by a moderator that beats every 0.1 s.
+
+| Setting | Default | Flag (both programs) |
+|---|---|---|
+| `heartbeat_interval` | 2 s | `--heartbeat` |
+| `heartbeat_misses` | 3 | `--heartbeat-misses` |
+
+Announced intervals must be in (0, 60] s; anything else is a `ProtocolError`. The cap keeps the detection bound finite even if a peer is misconfigured.
+
+**The bound:** a peer is declared dead **at most `misses × peer_interval` seconds after the last frame received from it**. With the defaults that is 6 s. The watchdog sleeps until exactly the moment the peer would become overdue (or until its own next send, whichever is sooner), so it doesn't add a polling delay on top.
+
+**Why heartbeats, when TCP has keepalive:** keepalive probes are answered by the peer's *kernel*, and TCP itself only sees whether bytes are ACKed. That leaves cases TCP can't notice:
+
+| Case | TCP's view | Heartbeat's view |
+|---|---|---|
+| Peer process frozen (`SIGSTOP`), deadlocked, or stuck in a long GC pause | healthy: the kernel ACKs and answers probes | silent, so dropped after the limit (`test_game.py`: 1.5 s limit, detected in 1.45 s) |
+| A middlebox or proxy that accepts traffic but delivers nothing | healthy: our segments are ACKed by the middlebox | silent, so **both** ends drop the link (`test_commslib.py` black-hole proxy) |
+| Network silently drops packets, link idle | keepalive notices after ~25 s | noticed after 6 s |
+| Network silently drops packets, data in flight | `TCP_USER_TIMEOUT` notices after 30 s | noticed after 6 s |
+
+**Interaction with large frames:** liveness is judged per *complete frame*. A frame must therefore arrive within the limit; with a 1 MiB cap and the default 6 s, that's about 175 KB/s. Game messages are under 1 KB.
+
+**Sending a heartbeat** goes through the same lock as any other send, so it never interleaves with a game frame. It is bounded by `interval`. A heartbeat that can't be sent (the peer isn't reading) is simply dropped; the silence check decides whether the peer is dead.
 
 ## Message envelope: seq / ack (stage 4, *not yet implemented*)
 

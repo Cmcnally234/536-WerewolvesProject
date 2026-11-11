@@ -34,7 +34,8 @@ import sys
 from dataclasses import dataclass, field
 
 import roles
-from commslib import DEFAULT_TLS_DIR, Server
+from commslib import (DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_HEARTBEAT_MISSES,
+                      DEFAULT_TLS_DIR, Server)
 
 
 def log(text: str) -> None:
@@ -551,6 +552,11 @@ async def main() -> int:
                         help="TCP address to listen on (default loopback only)")
     parser.add_argument("--tls", default=DEFAULT_TLS_DIR,
                         help=f"TLS files from make_certs.sh (default {DEFAULT_TLS_DIR})")
+    parser.add_argument("--heartbeat", type=float, default=DEFAULT_HEARTBEAT_INTERVAL,
+                        help="seconds between our heartbeats (default %(default)s)")
+    parser.add_argument("--heartbeat-misses", type=int, default=DEFAULT_HEARTBEAT_MISSES,
+                        help="drop a player silent for this many of its heartbeat "
+                             "intervals (default %(default)s)")
     parser.add_argument("--peercred", action="store_true",
                         help="enforce SO_PEERCRED (player ids must be Linux users)")
     parser.add_argument("--seed", type=int, help="fix the role shuffle")
@@ -576,7 +582,12 @@ async def main() -> int:
         for pid in args.players:
             os.makedirs(os.path.join(args.dir, pid), exist_ok=True)
 
-    server = Server()
+    try:
+        server = Server(heartbeat_interval=args.heartbeat,
+                        heartbeat_misses=args.heartbeat_misses)
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 2
     try:
         await server.start(args.players, base_dir=args.dir, check_peer_uid=args.peercred,
                            host=args.host, port=args.port, tls_dir=args.tls)

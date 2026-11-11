@@ -23,7 +23,8 @@ import sys
 import termios
 import tty
 
-from commslib import DEFAULT_TLS_DIR, Client, ConnectionClosed, player_socket_path
+from commslib import (DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_HEARTBEAT_MISSES,
+                      DEFAULT_TLS_DIR, Client, ConnectionClosed, player_socket_path)
 
 
 # ---------------------------------------------------------------------------
@@ -342,8 +343,8 @@ async def socket_loop(client: Client, term: Terminal, state: PlayerState,
         while True:
             try:
                 msg = await client.recv()
-            except ConnectionClosed:
-                term.print("* The moderator closed the connection.")
+            except ConnectionClosed as e:
+                term.print(f"* Lost the connection to the moderator: {e}")
                 return
             if log_file:
                 # Raw record of everything received; the role-leak test reads it.
@@ -424,6 +425,11 @@ async def main() -> int:
                         help="moderator's TCP address; must be a name or IP in its certificate")
     parser.add_argument("--tls", default=DEFAULT_TLS_DIR,
                         help=f"TLS files from make_certs.sh (default {DEFAULT_TLS_DIR})")
+    parser.add_argument("--heartbeat", type=float, default=DEFAULT_HEARTBEAT_INTERVAL,
+                        help="seconds between our heartbeats (default %(default)s)")
+    parser.add_argument("--heartbeat-misses", type=int, default=DEFAULT_HEARTBEAT_MISSES,
+                        help="give up on a moderator silent for this many of its "
+                             "heartbeat intervals (default %(default)s)")
     parser.add_argument("--log", help="append every received message (JSON lines) to this file")
     parser.add_argument("--bot", nargs="?", const="act", choices=["act", "silent"],
                         help="no keyboard; play automatically (act) or never respond (silent)")
@@ -431,7 +437,12 @@ async def main() -> int:
                         help="seconds to keep retrying the connection")
     args = parser.parse_args()
 
-    client = Client()
+    try:
+        client = Client(heartbeat_interval=args.heartbeat,
+                        heartbeat_misses=args.heartbeat_misses)
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 2
     try:
         await client.connect(player_socket_path(args.name, args.dir), retry_seconds=args.wait,
                              host=args.host, port=args.port, player_id=args.name,

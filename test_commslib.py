@@ -1,5 +1,5 @@
 """
-test_commslib.py -- commslib's failure paths and the TCP handshake.
+test_commslib.py -- commslib's failure paths, the TCP/TLS handshake, heartbeats.
 
     python3 test_commslib.py
 
@@ -53,8 +53,8 @@ class Net:
     def __init__(self, kind: str, tmp: str):
         self.kind, self.tmp = kind, tmp
 
-    async def server(self, send_timeout: float = 1.0, seats=SEATS) -> Server:
-        server = Server(send_timeout=send_timeout)
+    async def server(self, send_timeout: float = 1.0, seats=SEATS, **heartbeat) -> Server:
+        server = Server(send_timeout=send_timeout, **heartbeat)
         if self.kind == "tcp":
             await server.start(seats, port=0, tls_dir=PKI)   # 0 = let the kernel pick
             self.port = server.port
@@ -64,10 +64,11 @@ class Net:
             await server.start(seats, base_dir=self.tmp)
         return server
 
-    async def client(self, seat: str, retry_seconds: float = 2.0) -> Client:
-        client = Client()
+    async def client(self, seat: str, retry_seconds: float = 2.0, port=None,
+                     **heartbeat) -> Client:
+        client = Client(**heartbeat)
         if self.kind == "tcp":
-            await client.connect(port=self.port, player_id=seat, tls_dir=PKI,
+            await client.connect(port=port or self.port, player_id=seat, tls_dir=PKI,
                                  retry_seconds=retry_seconds)
         else:
             await client.connect(player_socket_path(seat, self.tmp), retry_seconds=retry_seconds)
@@ -129,6 +130,10 @@ async def test_bad_frames(kind: str):
                          "list, not an object")
     await bad_frame_case(kind, "oversized header",
                          struct.pack(">I", commslib.MAX_MESSAGE_BYTES + 1), "oversized")
+    for interval in (0, -1, True, "2", commslib.MAX_HEARTBEAT_INTERVAL + 1):
+        await bad_frame_case(kind, f"heartbeat interval {interval!r}",
+                             frame(json.dumps({"type": "HEARTBEAT", "interval": interval}).encode()),
+                             "bad heartbeat interval")
 
 
 async def test_client_sentinel_on_garbage():
@@ -430,6 +435,180 @@ async def test_tcp_connect_retry_and_close():
         print(f"PASS [tcp] missing TLS files fail at start(): {e}")
 
 
+
+# ---------------------------------------------------------------------------
+# Stage 3: heartbeats
+# ---------------------------------------------------------------------------
+
+HB = {"heartbeat_interval": 0.2, "heartbeat_misses": 3}   # dead after 0.6s of silence
+LIMIT = 0.6
+
+
+async def test_heartbeat_keeps_idle_link(kind: str):
+    """No game traffic for many heartbeat limits: the link stays up, and no
+    HEARTBEAT ever reaches the game on either side."""
+    with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
+        net = Net(kind, tmp)
+        server = await net.server(**HB)
+        client = await net.client("good", **HB)
+        await next_event(server, "good", "_connected")
+        await asyncio.sleep(LIMIT * 4)
+        assert server.connected() == ["good"]
+        try:
+            pid, msg = await server.recv_any(timeout=0.1)
+            raise AssertionError(f"moderator inbox got {pid}: {msg}")
+        except TimeoutError:
+            pass
+        try:
+            msg = await client.recv(timeout=0.1)
+            raise AssertionError(f"player got {msg}")
+        except TimeoutError:
+            pass
+        learned = (server._conns["good"].peer_interval, client._conn.peer_interval)
+        assert learned == (0.2, 0.2), learned
+        await client.close()
+        await server.close()
+    print(f"PASS [{kind}] idle {LIMIT * 4:.1f}s (4x the limit): still connected, "
+          f"no heartbeat leaked to either side; peer intervals learned {learned}")
+
+
+async def test_silent_player_detected(kind: str):
+    """A seated peer that sends nothing at all is dropped within the limit."""
+    with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
+        net = Net(kind, tmp)
+        server = await net.server(**HB)
+        _, w = await net.raw("bad")
+        await next_event(server, "bad", "_connected")
+        start = time.monotonic()
+        ev = await next_event(server, "bad", "_disconnected", timeout=LIMIT + 2)
+        elapsed = time.monotonic() - start
+        assert "no heartbeat" in ev["reason"], ev
+        assert elapsed < LIMIT + 0.3, f"took {elapsed:.2f}s"
+        w.close()
+        await server.close()
+    print(f"PASS [{kind}] silent player dropped after {elapsed:.2f}s: {ev['reason']!r}")
+
+
+async def test_silent_moderator_detected():
+    """A moderator that accepts but never sends: the player's recv() ends."""
+    with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
+        path = os.path.join(tmp, "sock")
+
+        async def mute(reader, writer):
+            await reader.read()   # keep the link open, say nothing
+
+        srv = await asyncio.start_unix_server(mute, path=path)
+        client = Client(**HB)
+        await client.connect(path)
+        start = time.monotonic()
+        try:
+            await client.recv(timeout=LIMIT + 2)
+            raise AssertionError("recv() returned")
+        except ConnectionClosed as e:
+            reason = str(e)
+        elapsed = time.monotonic() - start
+        assert "no heartbeat" in reason and elapsed < LIMIT + 0.3, (reason, elapsed)
+        await client.close()
+        srv.close()
+    print(f"PASS [unix] silent moderator: player's recv() raised after {elapsed:.2f}s: {reason!r}")
+
+
+class BlackHoleProxy:
+    """
+    A TCP relay between player and moderator that can start silently
+    discarding everything, in both directions, while keeping both TCP
+    connections open. Its kernel still ACKs every segment, so neither end's
+    TCP stack sees a problem: no reset, no retransmission timeout, and
+    keepalive probes are answered. Only application heartbeats can tell.
+    """
+
+    def __init__(self, target_port: int):
+        self.target_port = target_port
+        self.dropping = False
+
+    async def start(self) -> int:
+        self.server = await asyncio.start_server(self._relay, "127.0.0.1", 0)
+        return self.server.sockets[0].getsockname()[1]
+
+    async def _relay(self, client_r, client_w):
+        server_r, server_w = await asyncio.open_connection("127.0.0.1", self.target_port)
+        await asyncio.gather(self._pipe(client_r, server_w), self._pipe(server_r, client_w),
+                             return_exceptions=True)
+
+    async def _pipe(self, reader, writer):
+        try:
+            while data := await reader.read(65536):
+                if not self.dropping:
+                    writer.write(data)
+                    await writer.drain()
+        finally:
+            writer.close()
+
+
+async def test_blackhole_both_ends_notice():
+    """The network drops everything silently: BOTH ends notice within the limit."""
+    with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
+        net = Net("tcp", tmp)
+        server = await net.server(**HB)
+        proxy = BlackHoleProxy(net.port)
+        proxy_port = await proxy.start()
+        client = await net.client("good", port=proxy_port, **HB)
+        await next_event(server, "good", "_connected")
+        await asyncio.sleep(LIMIT * 2)            # healthy through the proxy...
+        assert server.connected() == ["good"]
+
+        proxy.dropping = True                     # ...then the partition
+        start = time.monotonic()
+
+        async def player_notices():
+            try:
+                await client.recv(timeout=LIMIT + 2)
+            except ConnectionClosed as e:
+                return time.monotonic() - start, str(e)
+            raise AssertionError("player never noticed")
+
+        (p_time, p_reason), ev = await asyncio.gather(
+            player_notices(), next_event(server, "good", "_disconnected", timeout=LIMIT + 2))
+        m_time = time.monotonic() - start
+        assert "no heartbeat" in ev["reason"] and "no heartbeat" in p_reason, (ev, p_reason)
+        assert max(p_time, m_time) < LIMIT + 0.3, (p_time, m_time)
+        await client.close()
+        await server.close()
+        proxy.server.close()
+    print(f"PASS [tcp] black-holed link: moderator dropped the player after {m_time:.2f}s, "
+          f"player gave up on the moderator after {p_time:.2f}s ({p_reason!r})")
+
+
+async def test_peer_interval_respected():
+    """The detector uses the SENDER's announced interval: a player beating
+    every 0.5s isn't dropped by a moderator that beats every 0.1s (whose own
+    interval x misses would be just 0.3s)."""
+    with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
+        net = Net("tcp", tmp)
+        server = await net.server(heartbeat_interval=0.1, heartbeat_misses=3)
+        client = await net.client("good", heartbeat_interval=0.5, heartbeat_misses=3)
+        await next_event(server, "good", "_connected")
+        await asyncio.sleep(1.2)
+        assert server.connected() == ["good"], "slow-beating player was dropped"
+        assert server._conns["good"].peer_interval == 0.5
+        await client.close()
+        await server.close()
+    print("PASS [tcp] moderator (0.1s x 3) kept a player that beats every 0.5s: "
+          "the limit follows the sender's interval")
+
+
+async def test_heartbeat_config_validated():
+    for bad in ({"heartbeat_interval": 0}, {"heartbeat_interval": 61},
+                {"heartbeat_misses": 0}):
+        for cls in (Server, Client):
+            try:
+                cls(**bad)
+                raise AssertionError(f"{cls.__name__}({bad}) accepted")
+            except ValueError:
+                pass
+    print("PASS heartbeat settings validated (interval in (0, 60], misses >= 1)")
+
+
 async def main():
     for kind in ("unix", "tcp"):
         await test_bad_frames(kind)
@@ -441,6 +620,13 @@ async def main():
     await test_tcp_socket_options()
     await test_tcp_refusals()
     await test_tcp_connect_retry_and_close()
+    for kind in ("unix", "tcp"):
+        await test_heartbeat_keeps_idle_link(kind)
+        await test_silent_player_detected(kind)
+    await test_silent_moderator_detected()
+    await test_blackhole_both_ends_notice()
+    await test_peer_interval_respected()
+    await test_heartbeat_config_validated()
     print("all commslib tests passed")
 
 

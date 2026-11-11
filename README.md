@@ -130,6 +130,8 @@ The seat name must match the Linux user. With `--peercred`, the moderator reject
 | `--discussion` | 60 | Seconds of day chat before voting |
 | `--vote-timeout` | 30 | Seconds to vote; anyone silent abstains |
 | `--max-rounds` | 20 | The game is a draw after this many night+day rounds |
+| `--heartbeat` | 2 | Seconds between the moderator's heartbeats |
+| `--heartbeat-misses` | 3 | Drop a player that has been silent for this many of *its* heartbeat intervals |
 | `--local` | off | Development only: create the seat directories yourself (see below) |
 
 | `player.py` flag | Meaning |
@@ -142,6 +144,7 @@ The seat name must match the Linux user. With `--peercred`, the moderator reject
 | `--bot` / `--bot silent` | No keyboard: play randomly, or never respond |
 | `--log FILE` | Append every received message to FILE as JSON lines |
 | `--wait` | Seconds to keep retrying the connection (default 30) |
+| `--heartbeat` / `--heartbeat-misses` | Same as the moderator's, from the player's side: how often to send, and how many of the moderator's intervals to wait before giving up on it (defaults 2 and 3) |
 
 ### Trying it without creating users (development mode)
 
@@ -253,10 +256,12 @@ Each message on the wire is one frame:
 | `class SeatRefused(ConnectionClosed)` | TCP: `Client.connect()` was turned away, by an `error` reply (`str(e)` is the moderator's reason) or by the moderator hanging up during the handshake (it rejected our certificate; its log says why) |
 | `DEFAULT_SEND_TIMEOUT = 5.0` | Default for `Server(send_timeout=...)` |
 | `CLOSE_TIMEOUT = 2.0` | How long `close()` waits for buffered data to flush before aborting |
+| `DEFAULT_HEARTBEAT_INTERVAL = 2.0`, `DEFAULT_HEARTBEAT_MISSES = 3`, `MAX_HEARTBEAT_INTERVAL = 60.0` | Heartbeat defaults, and the largest interval a peer may announce |
+| `HEARTBEAT = "HEARTBEAT"` | Reserved message type: commslib sends and consumes these itself, and they're never delivered to the game |
 
 ### `class Server`: the moderator's side
 
-Create one with `server = Server(send_timeout=5.0)`, then:
+Create one with `server = Server(send_timeout=5.0, heartbeat_interval=2.0, heartbeat_misses=3)`. Every seated connection sends a heartbeat every `heartbeat_interval` seconds, and is dropped (`_disconnected`, reason `no heartbeat ...`) if nothing arrives from it for `heartbeat_misses` of the intervals *it* announced. `ValueError` if the interval isn't in (0, 60] or misses < 1. Methods:
 
 | Method | Description |
 |---|---|
@@ -283,7 +288,7 @@ Create one with `server = Server(send_timeout=5.0)`, then:
 
 ### `class Client`: a player's side
 
-Create one with `client = Client()`, then:
+Create one with `client = Client(heartbeat_interval=2.0, heartbeat_misses=3)`. Heartbeats work as for the `Server`: if the moderator goes silent for too long, `recv()` raises `ConnectionClosed("no heartbeat ...")`. Methods:
 
 | Method | Description |
 |---|---|
@@ -299,8 +304,9 @@ The Client also reads in a background task that feeds a queue. As a result, a `r
 | Method | Description |
 |---|---|
 | `await send(msg: dict)` | Frame and send one message, then wait until the OS has accepted the bytes (`drain()`). Raises `TypeError` if `msg` isn't a dict, and `ValueError` if it's over 1 MiB. A lock stops concurrent sends from interleaving their bytes. |
-| `await recv() -> dict` | Read exactly one frame and return it as a dict. Raises `ConnectionClosed` on EOF or any socket error, and `ProtocolError` on an oversized or malformed frame. |
-| `abort()` | Drop the link immediately, discarding unsent data |
+| `await recv() -> dict` | Return the next frame that isn't a `HEARTBEAT` (those are consumed here; every frame updates `last_heard`). Raises `ConnectionClosed` on EOF or any socket error, and `ProtocolError` on an oversized or malformed frame or a bad heartbeat interval. |
+| `abort(reason=None)` | Drop the link immediately, discarding unsent data. `reason` becomes the message of the `ConnectionClosed` that the reader then gets. |
+| `await heartbeat(interval, misses)` | Run as a task for the life of the link: send `HEARTBEAT` every `interval` s, and `abort()` if nothing arrives for `misses ×` the peer's interval. `Server` and `Client` start it for you. |
 | `await close()` | Close the link, waiting up to `CLOSE_TIMEOUT` for unsent data to flush, then aborting |
 
 ### Minimal example
@@ -366,8 +372,8 @@ The game's own message types (`ROLE_ASSIGN`, `NIGHT_PROMPT`, `CHAT`, `VOTE_TALLY
 | `test_no_role_leak.py` | Automated: plays full games and checks that villagers never receive anyone else's role |
 | `test_night.py` | Automated: night phase, including the timeout for silent players and the Doctor rule |
 | `test_day.py` | Automated: chat relay, voting, ties, spectators |
-| `test_game.py` | Automated: whole games, win conditions, clean shutdown on signals |
-| `test_commslib.py` | Automated: commslib failure paths (malformed frames, a stuck reader, a dead link) on both transports, plus the TCP handshake and socket options |
+| `test_game.py` | Automated: whole games, win conditions, clean shutdown on signals, a frozen (`SIGSTOP`) player dropped by heartbeat |
+| `test_commslib.py` | Automated: commslib failure paths (malformed frames, a stuck reader, a dead link) on both transports, the TCP/TLS handshake and socket options, and heartbeats (idle link kept, silent peer dropped, black-holed link noticed by both ends) |
 | `testnet.py` | Test helper: `WW_TRANSPORT=tcp` makes the process-launching tests use TCP |
 | `DISTRIBUTED.md` | Project 2 protocol: transports, certificates, handshake, socket options, failure model |
 | `ARCHITECTURE.md` | Design document: diagram, framing, permissions, message table, concurrency |
