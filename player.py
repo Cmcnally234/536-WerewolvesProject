@@ -8,6 +8,7 @@ Neither waits for the other, so a message from the moderator shows up even
 while you're halfway through typing.
 
     local dev:   python3 player.py p1 --dir /tmp/werewolf-test
+    over TCP:    python3 player.py p1 --port 5555 [--host moderator.example]
     real users:  sudo -u player1 python3 /opt/werewolf/player.py player1
 """
 
@@ -418,6 +419,8 @@ async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("name", help="your seat / player id, e.g. player1")
     parser.add_argument("--dir", default="/run/werewolf")
+    parser.add_argument("--port", type=int, help="connect over TCP instead of a UNIX socket")
+    parser.add_argument("--host", default="127.0.0.1", help="moderator's TCP address")
     parser.add_argument("--log", help="append every received message (JSON lines) to this file")
     parser.add_argument("--bot", nargs="?", const="act", choices=["act", "silent"],
                         help="no keyboard; play automatically (act) or never respond (silent)")
@@ -427,7 +430,8 @@ async def main() -> int:
 
     client = Client()
     try:
-        await client.connect(player_socket_path(args.name, args.dir), retry_seconds=args.wait)
+        await client.connect(player_socket_path(args.name, args.dir), retry_seconds=args.wait,
+                             host=args.host, port=args.port, player_id=args.name)
     except OSError as e:
         print(f"could not connect: {e}", file=sys.stderr)
         return 1

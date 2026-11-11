@@ -19,6 +19,7 @@ import tempfile
 
 import roles
 from moderator import Game, Timers
+from testnet import net_args
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLAYERS = ["p1", "p2", "p3", "p4", "p5"]
@@ -160,15 +161,15 @@ def test_live_chat_relay():
     players = PLAYERS + ["p6"]
     discussion = 2.0
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        sock_dir = os.path.join(tmp, "s")
+        mod_net, player_net = net_args(os.path.join(tmp, "s"))
         mod = subprocess.Popen(
-            [sys.executable, os.path.join(HERE, "moderator.py"), *players, "--dir", sock_dir,
-             "--local", "--seed", "5", "--max-rounds", "1", "--night-timeout", "3",
+            [sys.executable, os.path.join(HERE, "moderator.py"), *players, *mod_net,
+             "--seed", "5", "--max-rounds", "1", "--night-timeout", "3",
              "--discussion", str(discussion), "--vote-timeout", "3"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         logs = {p: os.path.join(tmp, f"{p}.jsonl") for p in players}
         procs = [subprocess.Popen(
-            [sys.executable, os.path.join(HERE, "player.py"), p, "--dir", sock_dir,
+            [sys.executable, os.path.join(HERE, "player.py"), p, *player_net,
              "--bot", "--log", logs[p]], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
             for p in players]
         out, _ = mod.communicate(timeout=60)

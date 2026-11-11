@@ -17,6 +17,7 @@ import tempfile
 import time
 
 import roles
+from testnet import net_args
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLAYERS = ["p1", "p2", "p3", "p4", "p5"]
@@ -35,18 +36,18 @@ def seats(seed: int) -> dict[str, list[str]]:
 def run(seed: int, modes: dict[str, str], nights: int = 1):
     """Play `nights` nights. modes: seat -> "act" | "silent". Returns (mod log, seconds, logs)."""
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        sock_dir = os.path.join(tmp, "s")
+        mod_net, player_net = net_args(os.path.join(tmp, "s"))
         start = time.monotonic()
         mod = subprocess.Popen(
-            [sys.executable, os.path.join(HERE, "moderator.py"), *PLAYERS, "--dir", sock_dir,
-             "--local", "--seed", str(seed), "--night-timeout", str(TIMEOUT),
+            [sys.executable, os.path.join(HERE, "moderator.py"), *PLAYERS, *mod_net,
+             "--seed", str(seed), "--night-timeout", str(TIMEOUT),
              # Zero-length day: everyone abstains, nobody is voted out, so
              # the night results aren't disturbed by a random day vote.
              "--max-rounds", str(nights), "--discussion", "0", "--vote-timeout", "0"],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         logs = {p: os.path.join(tmp, f"{p}.jsonl") for p in PLAYERS}
         players = [subprocess.Popen(
-            [sys.executable, os.path.join(HERE, "player.py"), p, "--dir", sock_dir,
+            [sys.executable, os.path.join(HERE, "player.py"), p, *player_net,
              "--bot", modes.get(p, "act"), "--log", logs[p]],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL) for p in PLAYERS]
         out, _ = mod.communicate(timeout=60)

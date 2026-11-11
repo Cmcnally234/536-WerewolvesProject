@@ -6,6 +6,7 @@ ever learn what the moderator chooses to send them, which is how roles stay
 secret even though every message passes through one process.
 
     local dev:   python3 moderator.py p1 p2 p3 p4 --dir /tmp/ww --local
+    over TCP:    python3 moderator.py p1 p2 p3 p4 --port 5555 [--host 0.0.0.0]
     real users:  sudo -u modbot python3 /opt/werewolf/moderator.py \\
                      --peercred player1 player2 player3 player4
 
@@ -141,10 +142,10 @@ class Game:
         if kind == "_connected":
             return True    # leftover join notice from the lobby
         if kind == "_rejected":
-            log(f"rejected an impostor on {pid}'s socket (uid {msg.get('uid')})")
+            log(f"rejected a connection{f' for {pid}' if pid else ''}: {msg.get('reason')}")
             return True
         if kind == "_disconnected":
-            log(f"{pid} disconnected")
+            log(f"{pid} disconnected ({msg.get('reason')})")
             return False   # the phase may be waiting on them -- let it know
         if pid not in self.alive:
             await self.error(pid, "You're a spectator now -- you can't act or chat.")
@@ -506,6 +507,10 @@ async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("players", nargs="+")
     parser.add_argument("--dir", default="/run/werewolf")
+    parser.add_argument("--port", type=int,
+                        help="listen on TCP instead of UNIX sockets (0 = any free port)")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="TCP address to listen on (default loopback only)")
     parser.add_argument("--peercred", action="store_true",
                         help="enforce SO_PEERCRED (player ids must be Linux users)")
     parser.add_argument("--seed", type=int, help="fix the role shuffle")
@@ -523,12 +528,19 @@ async def main() -> int:
     if not roles.MIN_PLAYERS <= len(args.players) <= roles.MAX_PLAYERS:
         print(f"need {roles.MIN_PLAYERS}-{roles.MAX_PLAYERS} players", file=sys.stderr)
         return 2
+    if args.port is not None and (args.peercred or args.local):
+        print("--peercred and --local are for UNIX sockets; drop them with --port",
+              file=sys.stderr)
+        return 2
     if args.local:
         for pid in args.players:
             os.makedirs(os.path.join(args.dir, pid), exist_ok=True)
 
     server = Server()
-    await server.start(args.players, base_dir=args.dir, check_peer_uid=args.peercred)
+    await server.start(args.players, base_dir=args.dir, check_peer_uid=args.peercred,
+                       host=args.host, port=args.port)
+    if server.port is not None:
+        log(f"listening on TCP {args.host}:{server.port}")
 
     holder: dict = {}
     task = asyncio.create_task(session(server, args, holder))

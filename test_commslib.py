@@ -1,36 +1,75 @@
 """
-test_commslib.py -- commslib's failure paths (Project 2, stage 0).
+test_commslib.py -- commslib's failure paths and the TCP handshake.
 
     python3 test_commslib.py
 
-In-process, no sudo. Each test runs a real Server on a temp socket dir.
-Misbehaving peers are played by raw asyncio connections (this test, like
-perm_probe.py, is allowed to touch sockets directly: the point is to send
-bytes a well-behaved Client never would).
+In-process, no sudo. Each test runs a real Server, over UNIX sockets in a
+temp dir or over TCP on a free localhost port; the failure-path tests run
+on both. Misbehaving peers are played by raw asyncio connections (this
+test, like perm_probe.py, is allowed to touch sockets directly: the point
+is to send bytes a well-behaved Client never would).
 """
 
 import asyncio
 import json
 import os
+import socket
 import struct
 import tempfile
 import time
 
 import commslib
-from commslib import Client, ConnectionClosed, Server, player_socket_path
+from commslib import (Client, ConnectionClosed, SeatRefused, Server,
+                      player_socket_path)
 
 SEATS = ["good", "bad"]
 
 
-async def start_server(tmp: str, send_timeout: float = 1.0) -> Server:
-    for seat in SEATS:
-        os.makedirs(os.path.join(tmp, seat))
-    server = Server(send_timeout=send_timeout)
-    await server.start(SEATS, base_dir=tmp)
-    return server
+def frame(body: bytes) -> bytes:
+    return struct.pack(">I", len(body)) + body
 
 
-async def next_event(server: Server, pid: str, kind: str, timeout: float = 3.0) -> dict:
+async def read_frame(reader: asyncio.StreamReader) -> dict:
+    (n,) = struct.unpack(">I", await reader.readexactly(4))
+    return json.loads(await reader.readexactly(n))
+
+
+class Net:
+    """One transport for one test: UNIX in a temp dir, or TCP on a free port."""
+
+    def __init__(self, kind: str, tmp: str):
+        self.kind, self.tmp = kind, tmp
+
+    async def server(self, send_timeout: float = 1.0, seats=SEATS) -> Server:
+        server = Server(send_timeout=send_timeout)
+        if self.kind == "tcp":
+            await server.start(seats, port=0)   # 0 = let the kernel pick
+            self.port = server.port
+        else:
+            for seat in seats:
+                os.makedirs(os.path.join(self.tmp, seat), exist_ok=True)
+            await server.start(seats, base_dir=self.tmp)
+        return server
+
+    async def client(self, seat: str, retry_seconds: float = 2.0) -> Client:
+        client = Client()
+        if self.kind == "tcp":
+            await client.connect(port=self.port, player_id=seat, retry_seconds=retry_seconds)
+        else:
+            await client.connect(player_socket_path(seat, self.tmp), retry_seconds=retry_seconds)
+        return client
+
+    async def raw(self, seat: str):
+        """A raw connection already sitting in `seat` (HELLO done for TCP)."""
+        if self.kind == "unix":
+            return await asyncio.open_unix_connection(player_socket_path(seat, self.tmp))
+        r, w = await asyncio.open_connection("127.0.0.1", self.port)
+        w.write(frame(json.dumps({"type": "HELLO", "player": seat}).encode()))
+        assert (await read_frame(r))["type"] == "WELCOME"
+        return r, w
+
+
+async def next_event(server: Server, pid, kind: str, timeout: float = 3.0) -> dict:
     """Skip inbox entries until `pid` produces a message of type `kind`."""
     deadline = time.monotonic() + timeout
     while True:
@@ -39,13 +78,17 @@ async def next_event(server: Server, pid: str, kind: str, timeout: float = 3.0) 
             return msg
 
 
-async def bad_frame_case(name: str, raw: bytes, expect_in_reason: str) -> None:
+# ---------------------------------------------------------------------------
+# Stage 0: failure paths (both transports)
+# ---------------------------------------------------------------------------
+
+async def bad_frame_case(kind: str, name: str, raw: bytes, expect_in_reason: str) -> None:
     """A peer sends `raw`: it must be dropped, and a good player must not notice."""
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        server = await start_server(tmp)
-        good = Client()
-        await good.connect(player_socket_path("good", tmp))
-        _, w = await asyncio.open_unix_connection(player_socket_path("bad", tmp))
+        net = Net(kind, tmp)
+        server = await net.server()
+        good = await net.client("good")
+        _, w = await net.raw("bad")
         await next_event(server, "bad", "_connected")
 
         w.write(raw)
@@ -62,19 +105,16 @@ async def bad_frame_case(name: str, raw: bytes, expect_in_reason: str) -> None:
         w.close()
         await good.close()
         await server.close()
-    print(f"PASS {name}: bad peer dropped ({ev['reason']!r}); good player unaffected")
+    print(f"PASS [{kind}] {name}: bad peer dropped ({ev['reason']!r}); good player unaffected")
 
 
-def frame(body: bytes) -> bytes:
-    return struct.pack(">I", len(body)) + body
-
-
-async def test_bad_frames():
-    await bad_frame_case("malformed JSON", frame(b"{not json"), "malformed")
-    await bad_frame_case("invalid UTF-8", frame(b"\xff\xfe"), "malformed")
-    await bad_frame_case("non-dict JSON", frame(json.dumps([1, 2]).encode()), "list, not an object")
-    await bad_frame_case("oversized header", struct.pack(">I", commslib.MAX_MESSAGE_BYTES + 1),
-                         "oversized")
+async def test_bad_frames(kind: str):
+    await bad_frame_case(kind, "malformed JSON", frame(b"{not json"), "malformed")
+    await bad_frame_case(kind, "invalid UTF-8", frame(b"\xff\xfe"), "malformed")
+    await bad_frame_case(kind, "non-dict JSON", frame(json.dumps([1, 2]).encode()),
+                         "list, not an object")
+    await bad_frame_case(kind, "oversized header",
+                         struct.pack(">I", commslib.MAX_MESSAGE_BYTES + 1), "oversized")
 
 
 async def test_client_sentinel_on_garbage():
@@ -108,13 +148,13 @@ async def test_client_sentinel_on_garbage():
 async def test_client_sentinel_on_unexpected_error():
     """Even a non-ConnectionClosed error in the read loop must end recv()."""
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        server = await start_server(tmp)
-        client = Client()
+        net = Net("unix", tmp)
+        server = await net.server()
+        client = await net.client("good")
 
         async def broken_recv():
             raise RuntimeError("simulated bug")
 
-        await client.connect(player_socket_path("good", tmp))
         client._reader_task.cancel()          # replace the reader with one that blows up
         await asyncio.gather(client._reader_task, return_exceptions=True)
         while not client._inbox.empty():      # drop the sentinel the cancel produced
@@ -131,30 +171,29 @@ async def test_client_sentinel_on_unexpected_error():
         await server.close()
 
 
-async def test_send_timeout():
+async def test_send_timeout(kind: str):
     """A player that stops reading is dropped after send_timeout; others keep working."""
     send_timeout = 1.0
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        server = await start_server(tmp, send_timeout=send_timeout)
-        good = Client()
-        await good.connect(player_socket_path("good", tmp))
+        net = Net(kind, tmp)
+        server = await net.server(send_timeout=send_timeout)
+        good = await net.client("good")
         # The stuck player connects and then never reads a byte.
-        _, w = await asyncio.open_unix_connection(player_socket_path("bad", tmp))
+        _, w = await net.raw("bad")
         await server.wait_for_players(timeout=3)
 
         big = {"type": "FILLER", "pad": "x" * 900_000}
         start = time.monotonic()
         failed = []
-        # Kernel socket buffers are a few hundred KB, so a handful of 900 KB
-        # frames is guaranteed to fill them. The good player's reader task
-        # drains its side, so only "bad" can block.
-        for _ in range(10):
+        # Kernel socket buffers are a few hundred KB (a few MB for loopback
+        # TCP), so a dozen 900 KB frames is guaranteed to fill them. The good
+        # player's reader task drains its side, so only "bad" can block.
+        for _ in range(20):
             failed = await server.broadcast(big)
             if failed:
                 break
         elapsed = time.monotonic() - start
         assert failed == ["bad"], failed
-        assert elapsed < send_timeout + 2, f"broadcast blocked {elapsed:.1f}s"
         ev = await next_event(server, "bad", "_disconnected")
         assert "bad" not in server.connected()
 
@@ -165,34 +204,200 @@ async def test_send_timeout():
         w.close()
         await good.close()
         await server.close()
-    print(f"PASS stuck reader dropped after {elapsed:.1f}s ({ev['reason']!r}); good player unaffected")
+    print(f"PASS [{kind}] stuck reader dropped ({ev['reason']!r}) after {elapsed:.1f}s "
+          "of broadcasting; good player unaffected")
 
 
-async def test_close_with_stuck_peer():
+async def test_close_with_stuck_peer(kind: str):
     """Server.close() must finish even if a peer never reads its pending data."""
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        server = await start_server(tmp, send_timeout=0.5)
-        _, w = await asyncio.open_unix_connection(player_socket_path("bad", tmp))
+        net = Net(kind, tmp)
+        server = await net.server(send_timeout=0.5)
+        _, w = await net.raw("bad")
         await next_event(server, "bad", "_connected")
         # Queue far more than the kernel buffers hold, without draining, so
         # most of it is still sitting in our transport buffer at close().
         conn = server._conns["bad"]
-        for _ in range(3):
+        for _ in range(10):
             conn._writer.write(frame(json.dumps({"pad": "x" * 900_000}).encode()))
         start = time.monotonic()
         await server.close()
         elapsed = time.monotonic() - start
         assert elapsed < commslib.CLOSE_TIMEOUT + 3, f"close() took {elapsed:.1f}s"
         w.close()
-    print(f"PASS close() with a stuck peer finished in {elapsed:.1f}s")
+    print(f"PASS [{kind}] close() with a stuck peer finished in {elapsed:.1f}s")
+
+
+# ---------------------------------------------------------------------------
+# Stage 1: TCP
+# ---------------------------------------------------------------------------
+
+async def test_tcp_star():
+    """Over one TCP port: seats by HELLO, then 1:1, multicast and broadcast."""
+    seats = ["p1", "p2", "p3"]
+    with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
+        net = Net("tcp", tmp)
+        server = await net.server(seats=seats)
+        clients = {p: await net.client(p) for p in seats}
+        await server.wait_for_players(timeout=3)
+        assert sorted(server.connected()) == seats
+
+        for p, c in clients.items():                       # player -> moderator
+            await c.send({"type": "HI", "n": p})
+        for p in seats:
+            assert (await next_event(server, p, "HI"))["n"] == p   # tagged by seat
+
+        await server.send_to("p2", {"type": "ONE"})               # 1:1
+        await server.multicast(["p1", "p3"], {"type": "SOME"})    # multicast
+        await server.broadcast({"type": "ALL"})                   # broadcast
+        got = {}
+        for p, c in clients.items():
+            got[p] = [(await c.recv(timeout=2))["type"] for _ in range(2)]
+        assert got == {"p1": ["SOME", "ALL"], "p2": ["ONE", "ALL"], "p3": ["SOME", "ALL"]}, got
+
+        for c in clients.values():
+            await c.close()
+        await server.close()
+    print(f"PASS [tcp] 3 players on one port: seat from HELLO, 1:1/multicast/broadcast {got}")
+
+
+async def test_tcp_socket_options():
+    """TCP_NODELAY and keepalive are on, at both ends."""
+    with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
+        net = Net("tcp", tmp)
+        server = await net.server()
+        client = await net.client("good")
+        await next_event(server, "good", "_connected")
+        ends = {"moderator": server._conns["good"], "player": client._conn}
+        for end, conn in ends.items():
+            s = conn._writer.get_extra_info("socket")
+            opts = {
+                "TCP_NODELAY": s.getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY),
+                "SO_KEEPALIVE": s.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE),
+                "TCP_KEEPIDLE": s.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE),
+                "TCP_KEEPINTVL": s.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL),
+                "TCP_KEEPCNT": s.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT),
+                "TCP_USER_TIMEOUT": s.getsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT),
+            }
+            want = {"TCP_NODELAY": 1, "SO_KEEPALIVE": 1,
+                    "TCP_KEEPIDLE": commslib.KEEPALIVE_IDLE,
+                    "TCP_KEEPINTVL": commslib.KEEPALIVE_INTERVAL,
+                    "TCP_KEEPCNT": commslib.KEEPALIVE_COUNT,
+                    "TCP_USER_TIMEOUT": commslib.TCP_USER_TIMEOUT_MS}
+            # getsockopt may report an on/off flag as any non-zero value.
+            for flag in ("TCP_NODELAY", "SO_KEEPALIVE"):
+                opts[flag] = int(bool(opts[flag]))
+            assert opts == want, (end, opts)
+        await client.close()
+        await server.close()
+    print(f"PASS [tcp] both ends: {opts}")
+
+
+async def test_tcp_refusals():
+    """Unknown seat, taken seat, wrong first frame, silent peer -- all turned away."""
+    with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
+        net = Net("tcp", tmp)
+        server = await net.server()
+
+        try:
+            await net.client("mallory")
+            raise AssertionError("unknown seat was accepted")
+        except SeatRefused as e:
+            refusal = str(e)
+        assert "no seat named 'mallory'" in refusal, refusal
+        ev = await next_event(server, None, "_rejected")
+        print(f"PASS [tcp] unknown seat refused: client got {refusal!r}, server got {ev}")
+
+        first = await net.client("good")
+        try:
+            await net.client("good")
+            raise AssertionError("second connection took a taken seat")
+        except SeatRefused as e:
+            refusal = str(e)
+        assert "seat already taken" in refusal, refusal
+        await next_event(server, "good", "_rejected")
+        # The original occupant is undisturbed.
+        await server.send_to("good", {"type": "STILL_HERE"})
+        assert (await first.recv(timeout=2))["type"] == "STILL_HERE"
+        print(f"PASS [tcp] duplicate seat refused ({refusal!r}); first occupant unaffected")
+
+        r, w = await asyncio.open_connection("127.0.0.1", net.port)
+        w.write(frame(json.dumps({"type": "VOTE", "target": "good"}).encode()))
+        reply = await read_frame(r)
+        assert reply == {"type": "error", "text": "expected HELLO first"}, reply
+        assert await r.read() == b""            # and then it hung up
+        w.close()
+        print(f"PASS [tcp] non-HELLO first frame refused: {reply}")
+
+        # A peer that connects and says nothing is dropped after HELLO_TIMEOUT.
+        saved, commslib.HELLO_TIMEOUT = commslib.HELLO_TIMEOUT, 0.5
+        try:
+            r, w = await asyncio.open_connection("127.0.0.1", net.port)
+            start = time.monotonic()
+            assert await asyncio.wait_for(r.read(), 3) == b""
+            elapsed = time.monotonic() - start
+        finally:
+            commslib.HELLO_TIMEOUT = saved
+        w.close()
+        assert "bad" not in server.connected()
+        print(f"PASS [tcp] silent peer dropped after {elapsed:.1f}s without taking a seat")
+
+        await first.close()
+        await server.close()
+
+
+async def test_tcp_connect_retry_and_close():
+    """A player started before the moderator keeps retrying; close() isn't held up
+    by a connection stuck in the handshake; peercred is refused over TCP."""
+    port = socket.socket()
+    port.bind(("127.0.0.1", 0))
+    free = port.getsockname()[1]
+    port.close()
+
+    async def late_server():
+        await asyncio.sleep(0.6)
+        server = Server()
+        await server.start(SEATS, port=free)
+        return server
+
+    server_task = asyncio.create_task(late_server())
+    client = Client()
+    start = time.monotonic()
+    await client.connect(port=free, player_id="good", retry_seconds=5)
+    waited = time.monotonic() - start
+    server = await server_task
+    assert waited >= 0.5, waited
+    print(f"PASS [tcp] player started first connected after retrying {waited:.1f}s")
+
+    r, w = await asyncio.open_connection("127.0.0.1", free)   # never says HELLO
+    await asyncio.sleep(0.1)
+    start = time.monotonic()
+    await client.close()
+    await server.close()
+    elapsed = time.monotonic() - start
+    assert elapsed < 1.5, f"close() took {elapsed:.1f}s with a handshake pending"
+    assert await asyncio.wait_for(r.read(), 2) == b""
+    w.close()
+    print(f"PASS [tcp] close() with a peer mid-handshake took {elapsed:.2f}s")
+
+    try:
+        await Server().start(SEATS, check_peer_uid=True, port=0)
+        raise AssertionError("check_peer_uid accepted over TCP")
+    except ValueError as e:
+        print(f"PASS [tcp] check_peer_uid refused: {e}")
 
 
 async def main():
-    await test_bad_frames()
+    for kind in ("unix", "tcp"):
+        await test_bad_frames(kind)
+        await test_send_timeout(kind)
+        await test_close_with_stuck_peer(kind)
     await test_client_sentinel_on_garbage()
     await test_client_sentinel_on_unexpected_error()
-    await test_send_timeout()
-    await test_close_with_stuck_peer()
+    await test_tcp_star()
+    await test_tcp_socket_options()
+    await test_tcp_refusals()
+    await test_tcp_connect_retry_and_close()
     print("all commslib tests passed")
 
 

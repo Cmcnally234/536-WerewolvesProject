@@ -20,6 +20,7 @@ import tempfile
 import time
 
 import roles
+from testnet import net_args
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FAST = ["--night-timeout", "5", "--discussion", "0.5", "--vote-timeout", "3"]
@@ -32,12 +33,13 @@ class Run:
         self.players = players
         self.sock_dir = os.path.join(tmp, "s")
         self.logs = {p: os.path.join(tmp, f"{p}.jsonl") for p in players}
+        mod_net, player_net = net_args(self.sock_dir)
         self.mod = subprocess.Popen(
             [sys.executable, os.path.join(HERE, "moderator.py"), *players,
-             "--dir", self.sock_dir, "--local", "--seed", str(seed), *extra],
+             *mod_net, "--seed", str(seed), *extra],
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         self.procs = {p: subprocess.Popen(
-            [sys.executable, os.path.join(HERE, "player.py"), p, "--dir", self.sock_dir,
+            [sys.executable, os.path.join(HERE, "player.py"), p, *player_net,
              "--bot", (modes or {}).get(p, "act"), "--log", self.logs[p]],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
             for p in players}

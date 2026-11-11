@@ -1,13 +1,21 @@
 """
 commslib.py -- the ONLY file in this project that touches sockets.
 
-IPC primitive: UNIX domain *stream* sockets, driven by asyncio.
+IPC primitive: *stream* sockets driven by asyncio, over one of two
+transports (the framing and the API are identical on both):
 
-Topology: star. The moderator owns one listening socket per player
-(/run/werewolf/<player_id>/sock, see player_socket_path()). Each player
-connects only to its own socket. Because file permissions decide who can open which socket, the
-moderator knows *who* is on a connection by *which socket it arrived on* --
-a player cannot impersonate another player by lying in a message.
+  UNIX (Project 1, same machine). The moderator owns one listening socket
+  per player (/run/werewolf/<player_id>/sock, see player_socket_path()).
+  Each player connects only to its own socket. Because file permissions
+  decide who can open which socket, the moderator knows *who* is on a
+  connection by *which socket it arrived on*.
+
+  TCP (Project 2, across machines). The moderator listens on ONE host:port.
+  A player's first frame is HELLO naming its seat; the moderator answers
+  WELCOME or an error. Stage 1 trusts that name; stage 2 (TLS) will take
+  it from the player's certificate instead. See DISTRIBUTED.md.
+
+Topology: star either way -- players only ever talk to the moderator.
 
 Wire format (framing):
     +----------------------+------------------------------+
@@ -23,7 +31,9 @@ receiver exactly how many bytes make up the next message.
 Inbox event types the Server generates itself (prefixed with "_"):
     _connected     a player took its seat
     _disconnected  a player's connection closed ("reason" says why)
-    _rejected      SO_PEERCRED uid check failed (check_peer_uid=True)
+    _rejected      a connection was turned away ("reason" says why): wrong
+                   uid (SO_PEERCRED), seat already taken, or (TCP) a HELLO
+                   naming no seat -- that one has player id None
 
 Public API:
     player_socket_path(player_id, base_dir) -> the socket path for a seat
@@ -31,6 +41,7 @@ Public API:
     Connection  -- one framed, bidirectional link (used by Server and Client)
     Server      -- moderator side: start, send_to, multicast, broadcast, recv_any
     Client      -- player side:    connect, send, recv
+    SeatRefused -- Client.connect() over TCP: the moderator said no
 """
 
 import asyncio
@@ -87,6 +98,47 @@ DEFAULT_SEND_TIMEOUT = 5.0
 CLOSE_TIMEOUT = 2.0
 
 
+# --- TCP ------------------------------------------------------------------
+
+# Loopback by default: until stage 2 adds TLS, anyone who can reach the port
+# can claim any free seat, so don't listen on the network unless asked to.
+DEFAULT_TCP_HOST = "127.0.0.1"
+
+# How long either side waits for the other's half of the HELLO/WELCOME
+# handshake, and how long a player waits for the TCP connect itself (an
+# unreachable host would otherwise take ~2 minutes of SYN retries to fail).
+HELLO_TIMEOUT = 5.0
+CONNECT_TIMEOUT = 5.0
+
+# Kernel-level liveness for TCP links (stage 3 adds our own heartbeats on
+# top). With keepalive, an idle link whose peer has vanished -- crashed host,
+# pulled cable -- is noticed after IDLE + INTERVAL * COUNT = 25s instead of
+# never. Keepalive only probes an IDLE link, though; if we have unacked data
+# in flight, TCP retransmits instead, for ~15 minutes by default.
+# TCP_USER_TIMEOUT caps that: unacked data older than this kills the link.
+KEEPALIVE_IDLE = 10        # seconds of silence before the first probe
+KEEPALIVE_INTERVAL = 5     # seconds between probes
+KEEPALIVE_COUNT = 3        # unanswered probes before the kernel gives up
+TCP_USER_TIMEOUT_MS = 30_000
+
+
+def _tune_tcp(writer: asyncio.StreamWriter) -> None:
+    """Socket options for every TCP link, on both ends."""
+    sock = writer.get_extra_info("socket")
+    # TCP_NODELAY turns off Nagle's algorithm, which holds back a small
+    # write until the previous one is acked so it can batch them. Our
+    # messages are small and latency-sensitive (a vote, a chat line); with
+    # Nagle on, one could sit in our buffer for a whole round trip, or
+    # ~40ms more when it meets the peer's delayed ACK. (asyncio already
+    # sets this; we set it explicitly because we depend on it.)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, KEEPALIVE_IDLE)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, KEEPALIVE_INTERVAL)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, KEEPALIVE_COUNT)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_USER_TIMEOUT, TCP_USER_TIMEOUT_MS)
+
+
 class ConnectionClosed(ConnectionError):
     """
     The link is gone (peer hung up, reset, timed out or broke the protocol).
@@ -94,6 +146,10 @@ class ConnectionClosed(ConnectionError):
     A ConnectionError subclass, so code that already catches ConnectionError
     (e.g. Game.tell) handles every link failure without listing them all.
     """
+
+
+class SeatRefused(ConnectionClosed):
+    """Client.connect() over TCP: the moderator answered HELLO with an error."""
 
 
 class ProtocolError(ConnectionClosed):
@@ -188,10 +244,15 @@ class Connection:
 
 class Server:
     """
-    Listens on one UNIX socket per player and relays messages.
+    The moderator's side of the star. Two transports, chosen in start():
 
-    Concurrency model: every accepted connection gets its own reader task
-    (_serve_player). Each reader task loops forever pulling frames off its
+      UNIX  one listening socket per seat; the socket a connection arrives
+            on says which seat it is (file permissions enforce that).
+      TCP   ONE listening socket for everybody; a connection says which
+            seat it wants in its first frame (HELLO) -- see _accept_tcp.
+
+    Concurrency model (same for both): every accepted connection gets its
+    own reader task. Each reader task loops forever pulling frames off its
     socket and dropping them, tagged with the player id, into ONE shared
     asyncio.Queue (the "inbox"). The moderator's game logic then only has
     to await recv_any() -- it never blocks on any single player.
@@ -199,6 +260,8 @@ class Server:
 
     def __init__(self, send_timeout: float = DEFAULT_SEND_TIMEOUT):
         self.send_timeout = send_timeout
+        self.port: int | None = None      # TCP: the port actually bound
+        self._seats: list[str] = []
         self._listeners: list[asyncio.base_events.Server] = []
         self._paths: dict[str, str] = {}
         self._conns: dict[str, Connection] = {}
@@ -211,21 +274,34 @@ class Server:
         player_ids,
         base_dir: str = DEFAULT_SOCKET_DIR,
         check_peer_uid: bool = False,
+        *,
+        host: str | None = None,
+        port: int | None = None,
     ) -> None:
         """
-        Create a listening socket at <base_dir>/<player_id>/sock for each
-        player.
+        Start listening for the given seats.
 
-        The per-player directories must already exist. In the real setup,
-        setup_users.sh creates them owned modbot:playerN, mode 2750. We do
-        NOT create them here: a directory made by the moderator would have
-        the moderator's group, and the isolation would silently disappear.
-
+        port=None (the default) -> UNIX: a listening socket at
+        <base_dir>/<player_id>/sock for each player. The per-player
+        directories must already exist. In the real setup, setup_users.sh
+        creates them owned modbot:playerN, mode 2750. We do NOT create them
+        here: a directory made by the moderator would have the moderator's
+        group, and the isolation would silently disappear.
         check_peer_uid=True additionally requires each player_id to be a
         Linux username and rejects any connection whose kernel-reported uid
         (SO_PEERCRED) isn't that user's.
+
+        port given -> TCP: one listener on host:port (port=0 picks a free
+        port; read it back from self.port). base_dir is unused.
         """
-        for player_id in player_ids:
+        self._seats = list(player_ids)
+        if port is not None:
+            await self._start_tcp(host or DEFAULT_TCP_HOST, port, check_peer_uid)
+        else:
+            await self._start_unix(base_dir, check_peer_uid)
+
+    async def _start_unix(self, base_dir: str, check_peer_uid: bool) -> None:
+        for player_id in self._seats:
             seat_dir = os.path.join(base_dir, player_id)
             if not os.path.isdir(seat_dir):
                 raise FileNotFoundError(
@@ -246,7 +322,7 @@ class Server:
             # Default-argument trick binds the *current* player_id into the
             # callback; a plain closure would see only the last loop value.
             async def on_connect(reader, writer, player_id=player_id):
-                await self._serve_player(player_id, reader, writer)
+                await self._accept_unix(player_id, reader, writer)
 
             listener = await asyncio.start_unix_server(on_connect, path=path)
             # rw for owner (modbot) and group (playerN, inherited from the
@@ -258,8 +334,21 @@ class Server:
             os.chmod(path, 0o660)
             self._listeners.append(listener)
 
-    async def _serve_player(self, player_id, reader, writer) -> None:
-        """Runs as its own task for each connected player."""
+    async def _start_tcp(self, host: str, port: int, check_peer_uid: bool) -> None:
+        if check_peer_uid:
+            # SO_PEERCRED only exists for UNIX sockets: over TCP the kernel
+            # has no idea which local user (if any) is on the far end.
+            raise ValueError("check_peer_uid needs UNIX sockets; it can't work over TCP")
+        # reuse_address (SO_REUSEADDR): restarting the moderator right after
+        # a game would otherwise fail with "Address already in use" while
+        # the old connections sit in TIME_WAIT for a minute.
+        listener = await asyncio.start_server(self._accept_tcp, host, port,
+                                              reuse_address=True)
+        self.port = listener.sockets[0].getsockname()[1]
+        self._listeners.append(listener)
+
+    async def _accept_unix(self, player_id, reader, writer) -> None:
+        """Runs as its own task for each UNIX connection."""
         conn = Connection(reader, writer)
 
         # Defence in depth: file permissions decide who can reach the socket,
@@ -269,25 +358,73 @@ class Server:
         if expected is not None:
             uid = _peer_uid(writer)
             if uid != expected:
-                await self._refuse(conn, f"uid {uid} may not sit in {player_id}")
-                await self._inbox.put((player_id, {"type": "_rejected", "uid": uid}))
+                reason = f"uid {uid} may not sit in {player_id}"
+                await self._refuse(conn, reason)
+                await self._inbox.put((player_id, {"type": "_rejected", "uid": uid,
+                                                   "reason": reason}))
                 return
+        await self._serve_seat(player_id, conn)
 
+    async def _accept_tcp(self, reader, writer) -> None:
+        """
+        Runs as its own task for each TCP connection.
+
+        All seats share one port, so the seat isn't known until the peer
+        says which one it wants. STAGE 1 ONLY: that claim is trusted as-is,
+        so anyone who can reach the port can take any free seat. Stage 2
+        replaces it with the name in the peer's verified TLS certificate.
+        """
+        _tune_tcp(writer)
+        conn = Connection(reader, writer)
+        try:
+            # Bounded: a connection that never sends HELLO must not hold a
+            # task (and a file descriptor) open forever. Cancelling a recv
+            # mid-frame is safe HERE only because we hang up straight after.
+            hello = await asyncio.wait_for(conn.recv(), HELLO_TIMEOUT)
+        except (TimeoutError, ConnectionError):
+            await conn.close()
+            return
+        claimed = hello.get("player")
+        if hello.get("type") != "HELLO" or not isinstance(claimed, str):
+            await self._refuse(conn, "expected HELLO first")
+            return
+        if claimed not in self._seats:
+            reason = f"no seat named {claimed!r}"
+            await self._refuse(conn, reason)
+            # Not a seat, so there's no player id to file it under.
+            await self._inbox.put((None, {"type": "_rejected", "reason": reason}))
+            return
+        await self._serve_seat(claimed, conn, welcome=True)
+
+    async def _serve_seat(self, player_id: str, conn: Connection, welcome: bool = False) -> None:
+        """Seat the connection, then pump its frames into the inbox until it ends."""
         if player_id in self._conns:
             # Only one live connection per seat.
             await self._refuse(conn, "seat already taken")
+            await self._inbox.put((player_id, {"type": "_rejected",
+                                               "reason": "seat already taken"}))
             return
-
+        # No `await` between the check above and this line, so two
+        # connections racing for the same seat can't both pass the check:
+        # asyncio only switches tasks at an await.
         self._conns[player_id] = conn
-        await self._inbox.put((player_id, {"type": "_connected"}))
-        if len(self._conns) == len(self._paths):
-            self._all_connected.set()
 
         reason = "closed"
         try:
+            if welcome:
+                # TCP only: tells the client its HELLO was accepted. Sent
+                # before _connected is announced, so WELCOME is always the
+                # first frame the client sees.
+                await asyncio.wait_for(conn.send({"type": "WELCOME", "player": player_id}),
+                                       self.send_timeout)
+            await self._inbox.put((player_id, {"type": "_connected"}))
+            if len(self._conns) == len(self._seats):
+                self._all_connected.set()
             while True:
                 msg = await conn.recv()
                 await self._inbox.put((player_id, msg))
+        except TimeoutError:
+            reason = "WELCOME send timed out"
         except ConnectionClosed as e:
             reason = str(e)
         except Exception as e:
@@ -382,15 +519,19 @@ class Server:
         Orderly shutdown: stop accepting, hang up on every player, wait for
         each connection's reader task to finish, then remove the socket
         files. Anything already passed to send() is still delivered: closing
-        a UNIX stream socket sends EOF *after* the bytes already queued in
-        the kernel, never instead of them.
+        a stream socket (UNIX or TCP) sends EOF/FIN *after* the bytes already
+        queued, never instead of them.
         """
         for listener in self._listeners:
             listener.close()                 # no new connections
         await asyncio.gather(*(conn.close() for conn in list(self._conns.values())))
         for listener in self._listeners:
+            # Connections still in the HELLO handshake aren't in _conns yet;
+            # this hangs up on those too.
+            listener.close_clients()
+        for listener in self._listeners:
             try:
-                # Returns once every connection handler (_serve_player) has
+                # Returns once every connection handler (_serve_seat) has
                 # exited. Bounded, so one wedged peer can't hang shutdown.
                 await asyncio.wait_for(listener.wait_closed(), 2)
             except TimeoutError:
@@ -441,23 +582,68 @@ class Client:
             # player blocked in recv() would wait forever on a dead link.
             self._inbox.put_nowait(None)
 
-    async def connect(self, socket_path: str, retry_seconds: float = 10.0) -> None:
+    async def connect(
+        self,
+        socket_path: str | None = None,
+        retry_seconds: float = 10.0,
+        *,
+        host: str | None = None,
+        port: int | None = None,
+        player_id: str | None = None,
+    ) -> None:
         """
-        Connect to the moderator. Retries briefly because players may be
-        launched a moment before the moderator has created the socket.
+        Connect to the moderator: over UNIX at socket_path, or, if port is
+        given, over TCP to host:port, claiming seat player_id.
+
+        Retries briefly because players may be launched a moment before the
+        moderator is listening. Raises SeatRefused (TCP) if the moderator
+        turns the seat claim down; that is final, so it isn't retried.
         """
+        if port is None and socket_path is None:
+            raise ValueError("need socket_path (UNIX) or port (TCP)")
+        if port is not None and not player_id:
+            raise ValueError("TCP needs player_id for the HELLO")
         loop = asyncio.get_running_loop()
         deadline = loop.time() + retry_seconds
         while True:
             try:
-                reader, writer = await asyncio.open_unix_connection(socket_path)
-                self._conn = Connection(reader, writer)
+                if port is not None:
+                    self._conn = await self._open_tcp(host or DEFAULT_TCP_HOST, port, player_id)
+                else:
+                    reader, writer = await asyncio.open_unix_connection(socket_path)
+                    self._conn = Connection(reader, writer)
                 self._reader_task = asyncio.create_task(self._read_loop())
                 return
-            except (FileNotFoundError, ConnectionRefusedError):
+            except (FileNotFoundError, ConnectionRefusedError, TimeoutError):
+                # Nothing listening (yet), or the connect timed out.
                 if loop.time() >= deadline:
                     raise
                 await asyncio.sleep(0.2)
+
+    async def _open_tcp(self, host: str, port: int, player_id: str) -> Connection:
+        """TCP connect, then the HELLO -> WELCOME handshake. Returns the link."""
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port),
+                                                CONNECT_TIMEOUT)
+        _tune_tcp(writer)
+        conn = Connection(reader, writer)
+        try:
+            await conn.send({"type": "HELLO", "player": player_id})
+            # Read the reply directly, not through the reader task: nothing
+            # else may happen on this link until the moderator has said yes.
+            # (Cancelling mid-frame is fine here: on timeout we hang up.)
+            reply = await asyncio.wait_for(conn.recv(), HELLO_TIMEOUT)
+        except TimeoutError:
+            conn.abort()
+            # Not a TimeoutError, so connect() doesn't retry: the moderator
+            # IS there, it just didn't answer.
+            raise ConnectionClosed(f"no WELCOME within {HELLO_TIMEOUT}s") from None
+        except BaseException:
+            conn.abort()  # don't leak the socket on any other failure
+            raise
+        if reply.get("type") != "WELCOME":
+            await conn.close()
+            raise SeatRefused(reply.get("text") or f"unexpected {reply.get('type')!r} reply")
+        return conn
 
     async def send(self, msg: dict) -> None:
         await self._conn.send(msg)

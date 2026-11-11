@@ -28,7 +28,9 @@ Python 3.14, Fedora (SELinux enforcing). Standard library only.
 | `test_no_role_leak.py` | Full 6-player bot games; asserts villagers never receive role info outside `GAME_OVER`. Includes a self-test proving the checker can fail. |
 | `test_night.py` | Night phase: early finish, a silent Seer gets a no-op, everyone silent, the Doctor no-repeat rule. |
 | `test_day.py` | In-process `FakeServer` tests (majority, tie, timeout, spectators, early vote, self-vote) plus one real-process live chat relay test. |
-| `test_commslib.py` | In-process commslib failure paths: malformed / non-dict / non-UTF-8 / oversized frames, Client sentinel on garbage and on a reader bug, `send_to` timeout on a stuck reader, `close()` with a stuck peer. |
+| `test_commslib.py` | In-process commslib tests. Failure paths on UNIX **and** TCP: malformed / non-dict / non-UTF-8 / oversized frames, `send_to` timeout on a stuck reader, `close()` with a stuck peer. Client sentinel on garbage and on a reader bug. TCP: star over one port, socket options on both ends, refusals (unknown seat, taken seat, non-HELLO, silent peer), connect retry, close mid-handshake. |
+| `testnet.py` | `WW_TRANSPORT=unix|tcp` (default unix) → `net_args(sock_dir)` gives the moderator/player flags. Used by the four process-launching tests. |
+| `DISTRIBUTED.md` | Project 2 protocol doc: transports, handshake, socket options, failure model; later stages fill in heartbeat / seq-ack / resume. Keep in sync with commslib. |
 | `test_game.py` | Whole games (winner matches the rules, everyone exits 0, no socket files left), SIGTERM/SIGINT to the moderator, SIGTERM to a player mid-game. |
 | `README.md` | Grader-facing (someone else runs this on another machine): commslib name/location callout at the top, requirements, setup, "no compilation needed", how to play, the full **commslib API reference** (with a tested example), file list, testing guide, troubleshooting, uninstall. Keep it in sync when the API or flags change. |
 | `run_game.sh` | Launches one game as real users: the moderator (foreground, as modbot) and the bot seats (background, `setsid sudo -u playerN`). Prints the command for each human seat. Refuses stale `/opt/werewolf` code. |
@@ -80,6 +82,7 @@ Exit status = the moderator's (0 finished, 1 aborted or nobody joined). Logs go 
 
 - **moderator.py**:
   - `--dir`
+  - `--port` (TCP instead of UNIX; 0 = any free port) / `--host` (default 127.0.0.1); not with `--peercred`/`--local`
   - `--peercred` (enforce the uid check; player ids must be Linux usernames)
   - `--seed` (reproducible role deal)
   - `--join-timeout` (120)
@@ -90,6 +93,7 @@ Exit status = the moderator's (0 finished, 1 aborted or nobody joined). Logs go 
   - `--local`
 - **player.py**:
   - `--dir`
+  - `--port` / `--host` (connect over TCP; sends HELLO for the seat name)
   - `--bot [act|silent]` (no keyboard)
   - `--log FILE` (append every received message as JSON lines; used by the tests)
   - `--wait` (connect retry seconds, 30)
@@ -104,6 +108,7 @@ python3 test_no_role_leak.py
 python3 test_night.py
 python3 test_day.py
 python3 test_game.py
+WW_TRANSPORT=tcp python3 test_game.py   # any of the 4 process tests, over localhost TCP
 python3 ping_server.py & for p in p1 p2 p3; do python3 ping_client.py $p & done; wait   # optional --delay 3 on one client
 sudo ./test_permissions.sh      # real users only
 ```

@@ -19,6 +19,8 @@ import subprocess
 import sys
 import tempfile
 
+from testnet import net_args
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 # 6 seats = 2 villagers per game, and games last long enough to have days.
 PLAYERS = ["p1", "p2", "p3", "p4", "p5", "p6"]
@@ -44,9 +46,10 @@ def strings_in(obj):
 
 
 def run_game(seed: int, sock_dir: str, log_dir: str) -> dict[str, list[dict]]:
+    mod_net, player_net = net_args(sock_dir)
     mod = subprocess.Popen(
         [sys.executable, os.path.join(HERE, "moderator.py"), *PLAYERS,
-         "--dir", sock_dir, "--local", "--seed", str(seed), "--join-timeout", "15",
+         *mod_net, "--seed", str(seed), "--join-timeout", "15",
          "--night-timeout", "5", "--discussion", "1", "--vote-timeout", "3"],
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
@@ -54,7 +57,7 @@ def run_game(seed: int, sock_dir: str, log_dir: str) -> dict[str, list[dict]]:
     players = [
         subprocess.Popen(
             [sys.executable, os.path.join(HERE, "player.py"), p,
-             "--dir", sock_dir, "--bot", "--log", logs[p]],
+             *player_net, "--bot", "--log", logs[p]],
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
         )
         for p in PLAYERS

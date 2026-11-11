@@ -5,7 +5,7 @@
 > - **Name:** `commslib.py`
 > - **Location:** the project's top-level directory (next to this README). `setup_users.sh` installs it, with the rest of the code, to **`/opt/werewolf/commslib.py`**.
 > - **What it is:** the **only** file in the project that touches sockets. `moderator.py` and `player.py` do all of their communication through it.
-> - **IPC primitive:** UNIX domain **stream** sockets driven by **asyncio**.
+> - **IPC primitive:** UNIX domain **stream** sockets driven by **asyncio**. Project 2 adds a TCP transport through the same API (see [DISTRIBUTED.md](DISTRIBUTED.md)).
 > - **API:** see [Communications library API](#communications-library-api-commslibpy) below.
 
 A Werewolf / Mafia social deduction game for 4–6 players:
@@ -32,7 +32,7 @@ A Werewolf / Mafia social deduction game for 4–6 players:
 ## Requirements
 
 - **Linux**: UNIX domain sockets, `useradd`, `/run`. Developed and tested on Fedora 44 with SELinux enforcing.
-- **Python 3.11 or newer.** It was tested on Python 3.14. It needs 3.11 because it relies on `asyncio.wait_for` raising the built-in `TimeoutError`.
+- **Python 3.13 or newer** (on every machine, moderator and players). It was tested on Python 3.14. It needs 3.11 for `asyncio.wait_for` raising the built-in `TimeoutError`, and 3.13 for `asyncio.Server.close_clients()`, which shutdown uses to hang up on TCP connections still in the handshake.
 - **Standard library only.** Nothing to `pip install`.
 - **`sudo`**, to create the game's Linux users and its socket directory.
 - **Standard system tools:** `useradd`, `groupadd`, `usermod`, `userdel`, `install`, `setsid` and `pkill`. These are present on Fedora, RHEL, Debian and Ubuntu by default.
@@ -120,6 +120,8 @@ The seat name must match the Linux user. With `--peercred`, the moderator reject
 |---|---|---|
 | `players...` | (required) | Seat names, 4–6 of them |
 | `--dir` | `/run/werewolf` | Socket directory |
+| `--port N` | off (UNIX) | Listen on TCP port N instead of UNIX sockets (`0` = any free port, printed at startup). Can't be combined with `--peercred` or `--local`. |
+| `--host` | `127.0.0.1` | TCP address to listen on. Loopback by default, because seats aren't authenticated yet (stage 1). |
 | `--peercred` | off | Enforce the SO_PEERCRED uid check (seat names must be Linux users) |
 | `--seed N` | random | Reproducible role deal |
 | `--join-timeout` | 120 | Seconds to wait for all seats to connect |
@@ -133,6 +135,8 @@ The seat name must match the Linux user. With `--peercred`, the moderator reject
 |---|---|
 | `name` | Your seat, e.g. `player1` |
 | `--dir` | Socket directory (default `/run/werewolf`) |
+| `--port N` | Connect to the moderator over TCP instead (sends a `HELLO` for seat `name`) |
+| `--host` | Moderator's TCP address (default `127.0.0.1`) |
 | `--bot` / `--bot silent` | No keyboard: play randomly, or never respond |
 | `--log FILE` | Append every received message to FILE as JSON lines |
 | `--wait` | Seconds to keep retrying the connection (default 30) |
@@ -148,6 +152,14 @@ python3 player.py p2 --dir /tmp/ww --bot &               # bots for the other se
 python3 player.py p3 --dir /tmp/ww --bot &
 python3 player.py p4 --dir /tmp/ww --bot &
 python3 player.py p5 --dir /tmp/ww --bot &
+```
+
+The same over TCP: give every process `--port` instead of `--dir`.
+
+```bash
+python3 moderator.py p1 p2 p3 p4 p5 --port 5555
+python3 player.py p1 --port 5555                         # in another terminal (you)
+for p in p2 p3 p4 p5; do python3 player.py $p --port 5555 --bot & done
 ```
 
 ### Rules
@@ -189,8 +201,8 @@ Messages from the moderator appear as soon as they arrive, even while you're typ
 
 | | |
 |---|---|
-| Primitive | UNIX domain stream sockets (`AF_UNIX`, `SOCK_STREAM`) via `asyncio.start_unix_server` / `asyncio.open_unix_connection` |
-| Topology | Star: the moderator owns **one listening socket per player seat**; each player connects only to its own |
+| Primitive | UNIX domain stream sockets (`AF_UNIX`, `SOCK_STREAM`) via `asyncio.start_unix_server` / `asyncio.open_unix_connection`, **or** TCP via `asyncio.start_server` / `asyncio.open_connection` when a `port` is given |
+| Topology | Star. UNIX: the moderator owns **one listening socket per player seat**; each player connects only to its own. TCP: one listening port; each connection names its seat in a `HELLO` frame (handshake in [DISTRIBUTED.md](DISTRIBUTED.md)) |
 | Socket path | `<base_dir>/<player_id>/sock`, e.g. `/run/werewolf/player1/sock`; built by `player_socket_path()` |
 | Message | A Python `dict`, serialized as JSON |
 | Concurrency model | Every call except `connected()` and `player_socket_path()` is a **coroutine** (`await` it inside an asyncio event loop) |
@@ -217,9 +229,13 @@ Each message on the wire is one frame:
 |---|---|
 | `player_socket_path(player_id: str, base_dir: str = "/run/werewolf") -> str` | Returns `<base_dir>/<player_id>/sock`. Both sides use it, so they always agree on the path. |
 | `DEFAULT_SOCKET_DIR = "/run/werewolf"` | Default `base_dir` |
+| `DEFAULT_TCP_HOST = "127.0.0.1"` | Default TCP `host` for both sides |
+| `HELLO_TIMEOUT = 5.0`, `CONNECT_TIMEOUT = 5.0` | TCP handshake and connect limits |
+| `KEEPALIVE_IDLE/INTERVAL/COUNT = 10/5/3`, `TCP_USER_TIMEOUT_MS = 30000` | TCP keepalive settings applied to every TCP link (why: [DISTRIBUTED.md](DISTRIBUTED.md#socket-options-tcp-both-ends)) |
 | `MAX_MESSAGE_BYTES = 1048576` | Largest accepted frame body |
 | `class ConnectionClosed(ConnectionError)` | The link is gone: the other end hung up, the connection reset, a send timed out, or the peer broke the protocol. `str(e)` says which. |
 | `class ProtocolError(ConnectionClosed)` | The peer sent an oversized or malformed frame |
+| `class SeatRefused(ConnectionClosed)` | TCP: `Client.connect()` was turned away (`str(e)` is the moderator's reason) |
 | `DEFAULT_SEND_TIMEOUT = 5.0` | Default for `Server(send_timeout=...)` |
 | `CLOSE_TIMEOUT = 2.0` | How long `close()` waits for buffered data to flush before aborting |
 
@@ -229,7 +245,7 @@ Create one with `server = Server(send_timeout=5.0)`, then:
 
 | Method | Description |
 |---|---|
-| `await start(player_ids, base_dir="/run/werewolf", check_peer_uid=False)` | Opens a listening socket at `<base_dir>/<id>/sock` for each id and sets it to mode `0660`. A stale socket file left over from a crash is removed first. **The seat directories must already exist** (`setup_users.sh` creates them); raises `FileNotFoundError` if one is missing. With `check_peer_uid=True`, each `player_id` must be a Linux username (`KeyError` otherwise), and connections whose SO_PEERCRED uid doesn't match are rejected. |
+| `await start(player_ids, base_dir="/run/werewolf", check_peer_uid=False, *, host=None, port=None)` | **With `port`:** one TCP listener on `host:port` (`host` defaults to `127.0.0.1`; `port=0` picks a free port, readable afterwards as `server.port`). `base_dir` is ignored, and `check_peer_uid=True` raises `ValueError` (SO_PEERCRED is UNIX-only). **Without `port`:** opens a listening socket at `<base_dir>/<id>/sock` for each id and sets it to mode `0660`. A stale socket file left over from a crash is removed first. **The seat directories must already exist** (`setup_users.sh` creates them); raises `FileNotFoundError` if one is missing. With `check_peer_uid=True`, each `player_id` must be a Linux username (`KeyError` otherwise), and connections whose SO_PEERCRED uid doesn't match are rejected. |
 | `await wait_for_players(timeout=None)` | Returns once every seat has a connection. Raises `TimeoutError` if `timeout` seconds pass first. |
 | `connected() -> list[str]` | The ids currently connected (*not* a coroutine) |
 | `await send_to(player_id, msg: dict)` | **1:1**: send to one player. Raises `KeyError` if that player isn't connected. If the player doesn't make room for the message within `send_timeout` seconds (a stopped or wedged process), the server drops that connection, the reader posts `_disconnected`, and this raises `ConnectionClosed`. |
@@ -244,7 +260,7 @@ Create one with `server = Server(send_timeout=5.0)`, then:
 |---|---|
 | `"_connected"` | That player has taken its seat |
 | `"_disconnected"` | That player's connection closed; `msg["reason"]` says why |
-| `"_rejected"` | SO_PEERCRED check failed (`msg["uid"]` holds the offending uid). The connection was refused. |
+| `"_rejected"` | A connection was refused; `msg["reason"]` says why: SO_PEERCRED mismatch (`msg["uid"]` holds the uid), seat already taken, or (TCP) a `HELLO` naming no seat, which is reported with player id `None`. |
 
 **What the server sends on its own** (the game never needs to): if a second connection arrives for an occupied seat, or a uid check fails, the server sends that connection `{"type": "error", "text": ...}` and closes it.
 
@@ -256,7 +272,7 @@ Create one with `client = Client()`, then:
 
 | Method | Description |
 |---|---|
-| `await connect(socket_path, retry_seconds=10.0)` | Connect to the moderator. Retries every 0.2s while the socket doesn't exist yet or refuses the connection (the moderator may still be starting), for up to `retry_seconds`. A `PermissionError` (wrong user for this seat) is raised immediately. |
+| `await connect(socket_path=None, retry_seconds=10.0, *, host=None, port=None, player_id=None)` | Connect to the moderator: over UNIX at `socket_path`, or, with `port`, over TCP to `host:port` (then `player_id` is required and is sent in the `HELLO`). Retries every 0.2s while nothing is listening yet (the moderator may still be starting), for up to `retry_seconds`. A `PermissionError` (wrong user for this seat) or `SeatRefused` (TCP: unknown or taken seat) is raised immediately. |
 | `await send(msg: dict)` | Send one message to the moderator |
 | `await recv(timeout=None) -> dict` | Next message from the moderator. Raises `TimeoutError` if `timeout` expires, or `ConnectionClosed` if the link is gone for any reason (including a malformed frame). It never hangs on a dead link. |
 | `await close()` | Stop the background reader and close the connection |
@@ -333,7 +349,9 @@ The game's own message types (`ROLE_ASSIGN`, `NIGHT_PROMPT`, `CHAT`, `VOTE_TALLY
 | `test_night.py` | Automated: night phase, including the timeout for silent players and the Doctor rule |
 | `test_day.py` | Automated: chat relay, voting, ties, spectators |
 | `test_game.py` | Automated: whole games, win conditions, clean shutdown on signals |
-| `test_commslib.py` | Automated: commslib failure paths (malformed frames, a stuck reader, a dead link) |
+| `test_commslib.py` | Automated: commslib failure paths (malformed frames, a stuck reader, a dead link) on both transports, plus the TCP handshake and socket options |
+| `testnet.py` | Test helper: `WW_TRANSPORT=tcp` makes the process-launching tests use TCP |
+| `DISTRIBUTED.md` | Project 2 protocol: transports, handshake, socket options, failure model |
 | `ARCHITECTURE.md` | Design document: diagram, framing, permissions, message table, concurrency |
 | `README.md` | This file |
 | `CLAUDE.md` | Development notes, used by the AI assistant that helped write the code |
@@ -353,6 +371,14 @@ python3 test_commslib.py && python3 test_no_role_leak.py && python3 test_night.p
 ```
 
 All five should end with `PASS` / `all ... tests passed`.
+
+The same four game suites over localhost TCP (`test_commslib.py` already covers both):
+
+```bash
+export WW_TRANSPORT=tcp
+python3 test_no_role_leak.py && python3 test_night.py && python3 test_day.py && python3 test_game.py
+unset WW_TRANSPORT
+```
 
 The commslib demo on its own (one slow client shows the timeout):
 
