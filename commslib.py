@@ -18,6 +18,12 @@ transports (the framing and the API are identical on both):
 
 Topology: star either way -- players only ever talk to the moderator.
 
+Sessions (both transports): every connection starts with HELLO -> WELCOME.
+The WELCOME carries a session token. Game messages are numbered and kept
+until acknowledged (_Session), so when a link breaks the player reconnects
+with its token and both sides replay what the other missed -- in order,
+with no duplicates. See DISTRIBUTED.md for the protocol.
+
 Wire format (framing):
     +----------------------+------------------------------+
     | 4 bytes, big-endian  |  N bytes of UTF-8 JSON       |
@@ -30,9 +36,12 @@ send() can arrive split across several reads. The length prefix tells the
 receiver exactly how many bytes make up the next message.
 
 Inbox event types the Server generates itself (prefixed with "_"):
-    _connected     a player took its seat
-    _disconnected  a player's connection closed ("reason" says why, e.g.
-                   "no heartbeat for 6.0s (limit 3 x 2s)")
+    _connected     a player took its seat (a new session)
+    _away          its link broke ("reason"); the seat is held for
+                   "resume_timeout" seconds and messages to it are kept
+    _resumed       it came back ("away" seconds, "replayed" messages)
+    _disconnected  its session is over for good ("reason": left the game,
+                   didn't come back in time, protocol error, ...)
     _rejected      a connection was turned away ("reason" says why): wrong
                    uid (SO_PEERCRED), seat already taken, or (TCP) a failed
                    TLS handshake / a certificate or HELLO naming no seat or
@@ -44,14 +53,17 @@ Public API:
     ConnectionClosed, ProtocolError -- link failures (both ConnectionError)
     Connection  -- one framed, bidirectional link (used by Server and Client)
     Server      -- moderator side: start, send_to, multicast, broadcast, recv_any
-    Client      -- player side:    connect, send, recv
-    SeatRefused -- Client.connect() over TCP: the moderator said no
+    Client      -- player side:    connect, send, recv (reconnects by itself)
+    SeatRefused -- Client.connect(): the moderator said no
 """
 
 import asyncio
+import collections
+import hmac
 import json
 import os
 import pwd
+import secrets
 import socket
 import ssl
 import struct
@@ -109,6 +121,21 @@ DEFAULT_HEARTBEAT_MISSES = 3
 # Cap on the interval a peer may announce, so "bounded time" stays bounded
 # even if a peer is misconfigured (it's authenticated, not trusted blindly).
 MAX_HEARTBEAT_INTERVAL = 60.0
+
+# Sessions (stage 4, see _Session). Every game message travels as
+#   {"type": "DATA", "seq": n, "ack": m, "msg": {...the game message...}}
+# BYE ends a session on purpose (game over, player quit): no resume.
+DATA = "DATA"
+BYE = "BYE"
+# How long the moderator holds an away player's seat (and keeps its
+# messages) for it to reconnect. 0 = no resuming: a broken link ends the
+# session at once, as in Project 1.
+DEFAULT_RESUME_TIMEOUT = 120.0
+# Unacknowledged messages one session may hold. A whole game is a few
+# hundred, so hitting this means the peer is hopelessly behind.
+MAX_OUTBOX = 1000
+# Room for the envelope around a game message within MAX_MESSAGE_BYTES.
+ENVELOPE_SLACK = 256
 
 # How long close() waits for buffered bytes to flush before hard-aborting.
 # A graceful close waits until the peer has read everything we queued, which
@@ -232,8 +259,8 @@ class ConnectionClosed(ConnectionError):
 
 class SeatRefused(ConnectionClosed):
     """
-    Client.connect() over TCP: the moderator turned us away -- it answered
-    HELLO with an error, or rejected our certificate during the handshake.
+    Client.connect(): the moderator turned us away -- it answered HELLO with
+    an error, or (TCP) rejected our certificate during the handshake.
     """
 
 
@@ -254,19 +281,15 @@ class Connection:
     """
     A single framed link. Wraps asyncio's StreamReader/StreamWriter.
 
-    Also does liveness (see heartbeat()): recv() swallows the peer's
-    HEARTBEAT frames, and every frame received -- heartbeat or not --
-    counts as proof that the peer is alive.
+    Also does liveness (see heartbeat()): every frame received counts as
+    proof that the peer is alive. It knows nothing about sequence numbers
+    -- that's _Session's job, one layer up -- so a link can come and go
+    while the session carries on over the next one.
     """
 
     def __init__(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         self._reader = reader
         self._writer = writer
-        # Two different tasks could call send() at the same time (e.g. a
-        # broadcast and a private reply). Each send is two logical pieces
-        # (header + body); the lock guarantees they are never interleaved
-        # with another message's bytes on the wire.
-        self._send_lock = asyncio.Lock()
         # Liveness bookkeeping. time.monotonic() is the clock asyncio's own
         # loop.time() uses; it never jumps when the wall clock is changed.
         self.last_heard = time.monotonic()
@@ -275,31 +298,55 @@ class Connection:
         # the generic "peer closed the connection" it would otherwise see.
         self._abort_reason: str | None = None
 
-    async def send(self, msg: dict) -> None:
+    def write(self, msg: dict) -> None:
+        """
+        Hand one frame to the transport. Deliberately NOT a coroutine:
+
+        - header and body go out in ONE write() call, and no other task can
+          run in the middle of a plain function call, so frames from
+          different tasks can never interleave on the wire (no lock needed);
+        - a frame is either entirely in the send buffer or not at all, so
+          cancelling a later drain() can never leave half a frame behind;
+        - _Session relies on it: it numbers a message and writes it in the
+          same synchronous step, so wire order always equals seq order.
+        """
         if not isinstance(msg, dict):
             raise TypeError("messages must be dicts")
         body = json.dumps(msg).encode("utf-8")
         if len(body) > MAX_MESSAGE_BYTES:
             raise ValueError(f"message too large ({len(body)} bytes)")
-        async with self._send_lock:
-            self._writer.write(_HEADER.pack(len(body)) + body)
-            # drain() waits until the OS socket buffer has room. Without it,
-            # a slow reader would make our in-memory buffer grow forever.
-            await self._writer.drain()
+        if self._writer.transport.is_closing():
+            # Writing to a dead transport is silently discarded (and logged
+            # by asyncio); saying so lets callers fall back to the outbox.
+            raise ConnectionClosed(self._abort_reason or "the link is closed")
+        self._writer.write(_HEADER.pack(len(body)) + body)
+
+    async def drain(self) -> None:
+        """
+        Wait until the OS has room for what write() queued. Without it, a
+        slow reader would make our in-memory buffer grow forever.
+        """
+        await self._writer.drain()
+
+    async def send(self, msg: dict) -> None:
+        self.write(msg)
+        await self.drain()
 
     async def recv(self) -> dict:
-        """The next frame that isn't a HEARTBEAT."""
-        while True:
-            msg = await self._recv_frame()
-            self.last_heard = time.monotonic()
-            if msg.get("type") != HEARTBEAT:
-                return msg
+        """
+        The next frame, whatever its type. Records it as a sign of life, and
+        checks a HEARTBEAT's interval (the rest of it is _Session's business).
+        """
+        msg = await self._recv_frame()
+        self.last_heard = time.monotonic()
+        if msg.get("type") == HEARTBEAT:
             interval = msg.get("interval")
             # bool is an int subclass, so `True` would otherwise pass as 1.
             if (isinstance(interval, bool) or not isinstance(interval, (int, float))
                     or not 0 < interval <= MAX_HEARTBEAT_INTERVAL):
                 raise ProtocolError(f"bad heartbeat interval {interval!r}")
             self.peer_interval = float(interval)
+        return msg
 
     async def _recv_frame(self) -> dict:
         try:
@@ -334,11 +381,13 @@ class Connection:
             raise ProtocolError(f"peer sent a {type(msg).__name__}, not an object")
         return msg
 
-    async def heartbeat(self, interval: float, misses: int) -> None:
+    async def heartbeat(self, interval: float, misses: int, ack) -> None:
         """
         Run for the life of the link (as its own task): send a HEARTBEAT
         every `interval` seconds, and abort the link if the peer goes silent
-        for `misses` of ITS heartbeat intervals.
+        for `misses` of ITS heartbeat intervals. `ack()` gives the value to
+        piggyback on each heartbeat (see _Session), so acknowledgements keep
+        flowing even when no game messages are.
 
         Why at the application level, when TCP has keepalive? Keepalive is
         answered by the peer's KERNEL: a frozen or deadlocked process still
@@ -368,11 +417,11 @@ class Connection:
                 return
             if now >= next_send:
                 try:
+                    self.write({"type": HEARTBEAT, "interval": interval, "ack": ack()})
                     # Bounded like every other send. If it times out, the frame
-                    # is still queued (see Server.send_to), and the silence
-                    # check above decides whether the peer is gone.
-                    await asyncio.wait_for(
-                        self.send({"type": HEARTBEAT, "interval": interval}), interval)
+                    # is still queued, and the silence check above decides
+                    # whether the peer is gone.
+                    await asyncio.wait_for(self.drain(), interval)
                 except TimeoutError:
                     pass
                 except ConnectionError:
@@ -383,6 +432,9 @@ class Connection:
             # meantime, last_heard moves and the next pass just sleeps again.
             wake = min(next_send, self.last_heard + limit)
             await asyncio.sleep(max(wake - time.monotonic(), 0))
+
+    def is_closing(self) -> bool:
+        return self._writer.transport.is_closing()
 
     def abort(self, reason: str | None = None) -> None:
         """Drop the link immediately, discarding anything still buffered."""
@@ -403,6 +455,117 @@ class Connection:
 
 
 # ---------------------------------------------------------------------------
+# _Session: sequence numbers, acks and replay -- the part that survives a link
+# ---------------------------------------------------------------------------
+
+def _is_count(value) -> bool:
+    """A non-negative int (and not a bool, which is an int subclass)."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+class _Session:
+    """
+    One seat's message stream, numbered so it can outlive any single link.
+    BOTH ends keep one (the Server one per seat, the Client one for itself),
+    so both directions get the same guarantees:
+
+      out_seq  number of the last message we sent; each new one gets +1
+      outbox   (seq, msg) for everything sent but not yet acknowledged
+      in_seq   number of the last message we DELIVERED; doubles as our ack
+
+    Every frame we send carries ack = in_seq ("I have everything up to
+    here"); the peer then forgets those from its outbox. On a new link
+    each side states its in_seq in the handshake, and the other replays
+    everything after it, in order. The receiver delivers only seq ==
+    in_seq + 1 and silently drops seq <= in_seq, so a replay that overlaps
+    what already arrived can never produce a duplicate.
+    """
+
+    def __init__(self, token: str):
+        self.token = token
+        self.out_seq = 0
+        self.outbox: collections.deque[tuple[int, dict]] = collections.deque()
+        self.in_seq = 0
+        self.conn: Connection | None = None      # the live link; None while away
+        self.away_since = 0.0                    # Server side, for _resumed
+        self.expiry: asyncio.TimerHandle | None = None   # Server side
+
+    def send(self, msg: dict) -> None:
+        """
+        Number `msg`, keep it until acked, and write it to the live link if
+        there is one. Synchronous, so numbering and writing can't be pulled
+        apart by another task (see Connection.write). Raises ValueError /
+        TypeError for a bad message, ConnectionClosed if the peer has fallen
+        hopelessly behind.
+        """
+        if not isinstance(msg, dict):
+            raise TypeError("messages must be dicts")
+        # Check the size up front: a message that can't be framed must never
+        # get a sequence number, or every later one would wait behind it.
+        if len(json.dumps(msg).encode("utf-8")) > MAX_MESSAGE_BYTES - ENVELOPE_SLACK:
+            raise ValueError("message too large")
+        if len(self.outbox) >= MAX_OUTBOX:
+            raise ConnectionClosed(f"{MAX_OUTBOX} messages unacknowledged: peer too far behind")
+        self.out_seq += 1
+        self.outbox.append((self.out_seq, msg))
+        if self.conn is not None:
+            try:
+                self.conn.write(self._data(self.out_seq, msg))
+            except ConnectionError:
+                pass   # the link is dying; the message waits in the outbox
+
+    def _data(self, seq: int, msg: dict) -> dict:
+        return {"type": DATA, "seq": seq, "ack": self.in_seq, "msg": msg}
+
+    def on_frame(self, frame: dict) -> dict | None:
+        """
+        Process one frame from the peer. Returns the game message to deliver,
+        or None (a heartbeat, or a duplicate). ProtocolError if it's invalid.
+        """
+        kind = frame.get("type")
+        if kind not in (DATA, HEARTBEAT):
+            raise ProtocolError(f"unexpected {kind!r} frame")
+        self.on_ack(frame.get("ack"))
+        if kind == HEARTBEAT:
+            return None
+        seq, msg = frame.get("seq"), frame.get("msg")
+        if not _is_count(seq) or seq == 0 or not isinstance(msg, dict):
+            raise ProtocolError("malformed DATA frame")
+        if seq <= self.in_seq:
+            return None     # already delivered: a replay overlapping what we had
+        if seq != self.in_seq + 1:
+            # Can't happen on a stream socket with correct replay -- if it
+            # does, delivering it would silently lose the messages between.
+            raise ProtocolError(f"sequence gap: expected {self.in_seq + 1}, got {seq}")
+        self.in_seq = seq
+        return msg
+
+    def on_ack(self, ack) -> None:
+        """The peer has everything up to `ack`: forget those."""
+        if not _is_count(ack) or ack > self.out_seq:
+            raise ProtocolError(f"bad ack {ack!r} (we have only sent {self.out_seq})")
+        while self.outbox and self.outbox[0][0] <= ack:
+            self.outbox.popleft()
+
+    def pending_after(self, ack: int) -> int:
+        """How many messages a peer that has everything up to `ack` is missing."""
+        return sum(1 for seq, _ in self.outbox if seq > ack)
+
+    def attach(self, conn: Connection, peer_ack: int) -> int:
+        """
+        Make `conn` the live link: forget what the peer says it already has,
+        then replay the rest, oldest first. Returns how many were replayed.
+        Synchronous for the same reason as send(): a message sent by another
+        task can't slip in between the replay and the link going live.
+        """
+        self.on_ack(peer_ack)
+        self.conn = conn
+        for seq, msg in self.outbox:
+            conn.write(self._data(seq, msg))
+        return len(self.outbox)
+
+
+# ---------------------------------------------------------------------------
 # Server: moderator side of the star
 # ---------------------------------------------------------------------------
 
@@ -412,33 +575,43 @@ class Server:
 
       UNIX  one listening socket per seat; the socket a connection arrives
             on says which seat it is (file permissions enforce that).
-      TCP   ONE listening socket for everybody; a connection says which
-            seat it wants in its first frame (HELLO) -- see _accept_tcp.
+      TCP   ONE listening socket for everybody; the seat is the CN of the
+            player's verified TLS certificate -- see _handshake_tls.
 
-    Concurrency model (same for both): every accepted connection gets its
-    own reader task. Each reader task loops forever pulling frames off its
-    socket and dropping them, tagged with the player id, into ONE shared
-    asyncio.Queue (the "inbox"). The moderator's game logic then only has
-    to await recv_any() -- it never blocks on any single player.
+    Either way the connection then says HELLO, and gets a session: a new
+    one, or (with the session token) the one it had before its link broke.
+
+    Concurrency model: every accepted connection gets its own reader task.
+    Each reader task loops pulling frames off its socket and dropping the
+    game messages, tagged with the player id, into ONE shared asyncio.Queue
+    (the "inbox"). The moderator's game logic then only has to await
+    recv_any() -- it never blocks on any single player.
     """
 
     def __init__(self, send_timeout: float = DEFAULT_SEND_TIMEOUT,
                  heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
-                 heartbeat_misses: int = DEFAULT_HEARTBEAT_MISSES):
+                 heartbeat_misses: int = DEFAULT_HEARTBEAT_MISSES,
+                 resume_timeout: float = DEFAULT_RESUME_TIMEOUT):
         _check_heartbeat(heartbeat_interval, heartbeat_misses)
+        if resume_timeout < 0:
+            raise ValueError("resume_timeout can't be negative")
         self.send_timeout = send_timeout
         self.heartbeat_interval = heartbeat_interval
         self.heartbeat_misses = heartbeat_misses
+        self.resume_timeout = resume_timeout
         self.port: int | None = None      # TCP: the port actually bound
         self._tls: ssl.SSLContext | None = None
-        self._handshaking: set[asyncio.Task] = set()   # TCP: not seated yet
+        self._handshaking: set[asyncio.Task] = set()   # connections not seated yet
         self._seats: list[str] = []
         self._listeners: list[asyncio.base_events.Server] = []
         self._paths: dict[str, str] = {}
-        self._conns: dict[str, Connection] = {}
+        self._sessions: dict[str, _Session] = {}   # seat -> its session (live or away)
+        self._ended: set[str] = set()              # seats whose session is over for good
+        self._roster_locked = False                # see lock_roster()
         self._expected_uid: dict[str, int] = {}
         self._inbox: asyncio.Queue = asyncio.Queue()
         self._all_connected = asyncio.Event()
+        self._closing = False
 
     async def start(
         self,
@@ -495,7 +668,7 @@ class Server:
             # Default-argument trick binds the *current* player_id into the
             # callback; a plain closure would see only the last loop value.
             async def on_connect(reader, writer, player_id=player_id):
-                await self._accept_unix(player_id, reader, writer)
+                await self._accept(self._handshake_unix(player_id, reader, writer))
 
             listener = await asyncio.start_unix_server(on_connect, path=path)
             # rw for owner (modbot) and group (playerN, inherited from the
@@ -516,50 +689,58 @@ class Server:
         # Built before listening, so a missing or unreadable key fails here,
         # at startup, instead of on every connection.
         self._tls = _tls_context(MODERATOR_ID, tls_dir, server_side=True)
-        # The listener itself is plain TCP: _accept_tcp upgrades each
+
+        async def on_connect(reader, writer):
+            await self._accept(self._handshake_tls(reader, writer))
+
+        # The listener itself is plain TCP: _handshake_tls upgrades each
         # connection to TLS itself (see there for why).
         # reuse_address (SO_REUSEADDR): restarting the moderator right after
         # a game would otherwise fail with "Address already in use" while
         # the old connections sit in TIME_WAIT for a minute.
-        listener = await asyncio.start_server(self._accept_tcp, host, port,
-                                              reuse_address=True)
+        listener = await asyncio.start_server(on_connect, host, port, reuse_address=True)
         self.port = listener.sockets[0].getsockname()[1]
         self._listeners.append(listener)
 
-    async def _accept_unix(self, player_id, reader, writer) -> None:
-        """Runs as its own task for each UNIX connection."""
-        conn = Connection(reader, writer)
+    # --- admitting a connection ---------------------------------------------
 
-        # Defence in depth: file permissions decide who can reach the socket,
-        # SO_PEERCRED confirms who actually did. This catches e.g. modbot or
-        # root (both can get past the file permissions) sitting in a seat.
-        expected = self._expected_uid.get(player_id)
-        if expected is not None:
-            uid = _peer_uid(writer)
-            if uid != expected:
-                reason = f"uid {uid} may not sit in {player_id}"
-                await self._refuse(conn, reason)
-                await self._inbox.put((player_id, {"type": "_rejected", "uid": uid,
-                                                   "reason": reason}))
-                return
-        await self._serve_seat(player_id, conn)
-
-    async def _accept_tcp(self, reader, writer) -> None:
-        """Runs as its own task for each TCP connection: handshake, then the seat."""
+    async def _accept(self, handshake) -> None:
+        """
+        Runs as its own task for each connection: identify it (`handshake`,
+        transport-specific), then HELLO -> session, then serve it.
+        """
         # Tracked until seated, so close() can cancel a handshake in progress.
         task = asyncio.current_task()
         self._handshaking.add(task)
         try:
-            seated = await self._handshake_tcp(reader, writer)
+            identified = await handshake
+            admitted = await self._hello(*identified) if identified else None
         finally:
             self._handshaking.discard(task)
-        if seated is not None:
-            await self._serve_seat(*seated, welcome=True)
+        if admitted is not None:
+            await self._serve_link(*admitted)
 
-    async def _handshake_tcp(self, reader, writer) -> tuple[str, Connection] | None:
+    async def _handshake_unix(self, seat: str, reader, writer):
+        """UNIX: the socket says who it is. Returns (seat, conn, mismatch text) or None."""
+        conn = Connection(reader, writer)
+        # Defence in depth: file permissions decide who can reach the socket,
+        # SO_PEERCRED confirms who actually did. This catches e.g. modbot or
+        # root (both can get past the file permissions) sitting in a seat.
+        expected = self._expected_uid.get(seat)
+        if expected is not None:
+            uid = _peer_uid(writer)
+            if uid != expected:
+                reason = f"uid {uid} may not sit in {seat}"
+                await self._refuse(conn, reason)
+                await self._inbox.put((seat, {"type": "_rejected", "uid": uid,
+                                              "reason": reason}))
+                return None
+        return seat, conn, f"this socket is {seat!r}'s"
+
+    async def _handshake_tls(self, reader, writer):
         """
-        TLS handshake, then HELLO. Returns (seat, connection) to seat, or
-        None if the connection was turned away (and already closed).
+        TCP: TLS handshake; the seat is the CN of the verified certificate.
+        Returns (seat, conn, mismatch text) or None.
 
         All seats share one port, so the seat can't come from the socket as
         it does with UNIX. It comes from the player's certificate, which the
@@ -581,9 +762,26 @@ class Server:
             await self._inbox.put((None, {"type": "_rejected",
                                           "reason": f"TLS handshake failed: {reason}"}))
             return None
-
         conn = Connection(reader, writer)
         cert_name = _cert_common_name(writer.get_extra_info("peercert"))
+        if cert_name not in self._seats:
+            # Signed by our CA, but not for any seat in this game (an old
+            # player name, the moderator's own certificate, ...).
+            reason = f"certificate is for {cert_name!r}, which is not a seat in this game"
+            await self._refuse(conn, reason)
+            await self._inbox.put((None, {"type": "_rejected", "reason": reason}))
+            return None
+        return cert_name, conn, f"certificate is for {cert_name!r}"
+
+    async def _hello(self, seat: str, conn: Connection, identity: str):
+        """
+        Read HELLO; give the connection a new session or resume its old one;
+        send WELCOME and replay. Returns (seat, session, conn) to serve, or
+        None if it was turned away.
+
+        HELLO   {"player": seat, "token": None | str, "ack": int}
+        WELCOME {"player", "token", "ack", "resumed", "replaying", "resume_timeout"}
+        """
         try:
             # Bounded: a connection that never sends HELLO must not hold a
             # task (and a file descriptor) open forever. Cancelling a recv
@@ -592,81 +790,154 @@ class Server:
         except (TimeoutError, ConnectionError):
             await conn.close()
             return None
-        claimed = hello.get("player")
-        if hello.get("type") != "HELLO" or not isinstance(claimed, str):
+        claimed, token, ack = hello.get("player"), hello.get("token"), hello.get("ack", 0)
+        if (hello.get("type") != "HELLO" or not isinstance(claimed, (str, type(None)))
+                or not isinstance(token, (str, type(None))) or not _is_count(ack)):
             await self._refuse(conn, "expected HELLO first")
             return None
+        # UNIX may leave "player" out (the socket already says who it is);
+        # TCP must name the seat, and it must be the certificate's.
+        if (claimed is None and self._tls is not None) or (claimed not in (None, seat)):
+            reason = f"{identity}, not {claimed!r}"
+            await self._refuse(conn, reason)
+            await self._inbox.put((None, {"type": "_rejected", "reason": reason}))
+            return None
 
-        if cert_name not in self._seats:
-            # Signed by our CA, but not for any seat in this game (an old
-            # player name, the moderator's own certificate, ...).
-            reason = f"certificate is for {cert_name!r}, which is not a seat in this game"
-        elif claimed != cert_name:
-            # e.g. player2's certificate trying to sit in player1's seat.
-            reason = f"certificate is for {cert_name!r}, not {claimed!r}"
+        # From here to attach() there is no `await`, so two connections racing
+        # for the same seat (or the same session) can't both get it: asyncio
+        # only switches tasks at an await. For the same reason the link can't
+        # die in the middle: checking it once here means the writes below
+        # (WELCOME, replay) can't fail half-way through taking the seat.
+        if conn.is_closing():
+            return None
+        session = self._sessions.get(seat)
+        if token is None:
+            if session is not None:
+                reason = "seat already taken (a reconnect must present its session token)"
+            elif seat in self._ended and self._roster_locked:
+                reason = "this seat's session has ended and the game has started"
+            else:
+                reason = None
+                session = self._sessions[seat] = _Session(secrets.token_urlsafe(16))
+        elif session is None or not hmac.compare_digest(token, session.token):
+            # compare_digest: constant time, so response timing can't be
+            # used to guess the token one character at a time.
+            reason = "unknown or expired session token"
+        elif ack > session.out_seq:
+            reason = f"ack {ack} is ahead of what we sent ({session.out_seq})"
         else:
-            return cert_name, conn
-        await self._refuse(conn, reason)
-        # Not seated, so there's no player id to file it under.
-        await self._inbox.put((None, {"type": "_rejected", "reason": reason}))
-        return None
+            reason = None
+        if reason is not None:
+            await self._refuse(conn, reason)
+            await self._inbox.put((seat, {"type": "_rejected", "reason": reason}))
+            return None
 
-    async def _serve_seat(self, player_id: str, conn: Connection, welcome: bool = False) -> None:
-        """Seat the connection, then pump its frames into the inbox until it ends."""
-        if player_id in self._conns:
-            # Only one live connection per seat.
-            await self._refuse(conn, "seat already taken")
-            await self._inbox.put((player_id, {"type": "_rejected",
-                                               "reason": "seat already taken"}))
-            return
-        # No `await` between the check above and this line, so two
-        # connections racing for the same seat can't both pass the check:
-        # asyncio only switches tasks at an await.
-        self._conns[player_id] = conn
+        resumed = token is not None
+        old = session.conn
+        if old is not None:
+            # The player noticed the dead link before we did (or it isn't
+            # dead yet from here). The token proves it's the same session,
+            # so the new link wins; the old reader sees it was replaced and
+            # stays quiet.
+            old.abort("replaced by a resumed connection")
+        if session.expiry is not None:
+            session.expiry.cancel()
+            session.expiry = None
+        conn.write({"type": "WELCOME", "player": seat, "token": session.token,
+                    "ack": session.in_seq, "resumed": resumed,
+                    "replaying": session.pending_after(ack),
+                    "resume_timeout": self.resume_timeout})
+        replayed = session.attach(conn, ack)
 
-        reason = "closed"
-        heartbeat = None
-        try:
-            if welcome:
-                # TCP only: tells the client its HELLO was accepted. Sent
-                # before _connected is announced, so WELCOME is always the
-                # first frame the client sees.
-                await asyncio.wait_for(conn.send({"type": "WELCOME", "player": player_id}),
-                                       self.send_timeout)
-            # Runs beside this reader loop. If the player goes silent, it
-            # aborts the link, conn.recv() below raises with its reason, and
-            # the finally block posts _disconnected -- the one path every
-            # kind of disconnect takes.
-            heartbeat = asyncio.create_task(
-                conn.heartbeat(self.heartbeat_interval, self.heartbeat_misses))
-            await self._inbox.put((player_id, {"type": "_connected"}))
-            if len(self._conns) == len(self._seats):
+        if resumed:
+            away = time.monotonic() - session.away_since if old is None else 0.0
+            await self._inbox.put((seat, {"type": "_resumed", "replayed": replayed,
+                                          "away": round(away, 2)}))
+        else:
+            await self._inbox.put((seat, {"type": "_connected"}))
+            if len(self._sessions) == len(self._seats):
                 self._all_connected.set()
+        return seat, session, conn
+
+    # --- serving one live link ----------------------------------------------
+
+    async def _serve_link(self, seat: str, session: _Session, conn: Connection) -> None:
+        """Pump one link's game messages into the inbox until the link ends."""
+        # Runs beside this reader loop. If the player goes silent, it aborts
+        # the link and conn.recv() below raises with its reason.
+        heartbeat = asyncio.create_task(conn.heartbeat(
+            self.heartbeat_interval, self.heartbeat_misses, ack=lambda: session.in_seq))
+        reason, final = "closed", False
+        try:
+            # WELCOME and the replay were written in _hello(); now wait for
+            # them to leave, bounded like any send.
+            await asyncio.wait_for(conn.drain(), self.send_timeout)
             while True:
-                msg = await conn.recv()
-                await self._inbox.put((player_id, msg))
+                frame = await conn.recv()
+                if frame.get("type") == BYE:
+                    reason, final = "left the game", True
+                    break
+                msg = session.on_frame(frame)
+                if msg is not None:
+                    await self._inbox.put((seat, msg))
         except TimeoutError:
-            reason = "WELCOME send timed out"
+            reason = f"stopped reading (replay not taken within {self.send_timeout}s)"
+            conn.abort(reason)
+        except ProtocolError as e:
+            # Stage 0 policy: a peer that breaks the protocol is not trusted
+            # again, so its session ends rather than waiting for a resume.
+            reason, final = str(e), True
         except ConnectionClosed as e:
             reason = str(e)
         except Exception as e:
-            # Anything else is a bug, but it must still end in _disconnected:
-            # otherwise the seat looks connected forever and the game waits
-            # on a player nobody is reading from.
-            reason = f"reader failed: {e!r}"
+            # Anything else is a bug, but it must still end the link
+            # properly: otherwise the seat looks live forever and the game
+            # waits on a player nobody is reading from.
+            reason, final = f"reader failed: {e!r}", True
         finally:
-            # Tell the game logic this player is gone, through the same
-            # inbox, so it learns about it in order with everything else.
-            # put_nowait: the inbox is unbounded, and a finally block that
-            # may be running under cancellation shouldn't await anything
-            # it doesn't have to.
-            if self._conns.get(player_id) is conn:
-                del self._conns[player_id]
-            self._inbox.put_nowait((player_id, {"type": "_disconnected", "reason": reason}))
+            heartbeat.cancel()
+            # Only the CURRENT link may change the session's state: if a
+            # resume already replaced this link, the player isn't away.
+            if session.conn is conn and not self._closing:
+                session.conn = None
+                if final:
+                    self._end(seat, session, reason)
+                else:
+                    self._away(seat, session, reason)
             await conn.close()
-            if heartbeat is not None:
-                heartbeat.cancel()
-                await asyncio.gather(heartbeat, return_exceptions=True)
+            await asyncio.gather(heartbeat, return_exceptions=True)
+
+    def _away(self, seat: str, session: _Session, reason: str) -> None:
+        """The link is gone but the session isn't: hold the seat for a while."""
+        if self.resume_timeout <= 0:
+            self._end(seat, session, reason)
+            return
+        session.away_since = time.monotonic()
+        session.expiry = asyncio.get_running_loop().call_later(
+            self.resume_timeout, self._expire, seat, session, reason)
+        # put_nowait: the inbox is unbounded, and this runs from a finally
+        # block that may be under cancellation.
+        self._inbox.put_nowait((seat, {"type": "_away", "reason": reason,
+                                       "resume_timeout": self.resume_timeout}))
+
+    def _expire(self, seat: str, session: _Session, reason: str) -> None:
+        """Timer callback: the player didn't come back in time."""
+        session.expiry = None
+        if self._sessions.get(seat) is session and session.conn is None:
+            self._end(seat, session,
+                      f"did not come back within {self.resume_timeout:g}s (lost: {reason})")
+
+    def _end(self, seat: str, session: _Session, reason: str) -> None:
+        """The session is over for good: the game is told with _disconnected."""
+        if self._sessions.get(seat) is not session:
+            return   # already ended
+        del self._sessions[seat]
+        self._ended.add(seat)
+        session.conn = None
+        if session.expiry is not None:
+            session.expiry.cancel()
+            session.expiry = None
+        self._inbox.put_nowait((seat, {"type": "_disconnected", "reason": reason}))
 
     async def _refuse(self, conn: Connection, text: str) -> None:
         """Best-effort error message, then hang up. Never raises."""
@@ -676,12 +947,32 @@ class Server:
             pass  # the peer is being turned away anyway
         await conn.close()
 
+    # --- who's here -----------------------------------------------------------
+
     async def wait_for_players(self, timeout: float | None = None) -> None:
-        """Block until every seat has a connection (or raise TimeoutError)."""
+        """Block until every seat has a session (or raise TimeoutError)."""
         await asyncio.wait_for(self._all_connected.wait(), timeout)
 
+    def lock_roster(self) -> None:
+        """
+        From now on, a seat whose session has ended can't be taken by a new
+        one. Call it when the game starts: by then each session has been
+        sent things (a role!) that a fresh session wouldn't have. Before it
+        -- in the lobby -- a player who left can simply join again.
+        """
+        self._roster_locked = True
+
     def connected(self) -> list[str]:
-        return list(self._conns)
+        """
+        Seats still in the game: a live link, or away but resumable. Messages
+        to an away seat are kept and replayed when it comes back, so for
+        sending purposes it's as good as connected.
+        """
+        return list(self._sessions)
+
+    def live(self) -> list[str]:
+        """Seats with a working link right now."""
+        return [seat for seat, s in self._sessions.items() if s.conn is not None]
 
     # --- sending: 1:1, multicast, broadcast -------------------------------
 
@@ -689,31 +980,43 @@ class Server:
         """
         1:1 -- send to exactly one player.
 
-        Raises KeyError if the seat is empty, ConnectionError (usually
-        ConnectionClosed) if the send fails or the player hasn't made room
-        for it within send_timeout seconds.
+        If the player is away, the message waits in its outbox and is
+        replayed, in order, when it comes back. If its link is up but it
+        hasn't made room within send_timeout seconds, the link is dropped
+        (the player is then away; the message is still kept).
+
+        Raises KeyError if the seat has no session (never joined, or ended),
+        ConnectionClosed if the player has fallen too far behind (its
+        session is ended).
         """
-        conn = self._conns.get(player_id)
-        if conn is None:
-            raise KeyError(f"{player_id} is not connected")
+        session = self._sessions.get(player_id)
+        if session is None:
+            raise KeyError(f"{player_id} is not in the game")
         try:
-            await asyncio.wait_for(conn.send(msg), self.send_timeout)
+            session.send(msg)
+        except ConnectionClosed as e:
+            conn = session.conn
+            self._end(player_id, session, str(e))
+            if conn is not None:
+                conn.abort(str(e))
+            raise
+        conn = session.conn
+        if conn is None:
+            return   # away: queued for replay
+        try:
+            await asyncio.wait_for(conn.drain(), self.send_timeout)
         except TimeoutError:
-            # Cancelling here can't corrupt the stream: Connection.send()
-            # hands the whole frame to write() in one synchronous call, so
-            # the timeout can only interrupt the drain() *after* it. But the
-            # player isn't reading, and every later send would pile up in
-            # memory behind this one. Hang up instead: the reader task sees
-            # the link drop and posts _disconnected, so the game learns about
-            # it the same way as any other disconnect.
-            reason = f"{player_id} stopped reading (send timed out after {self.send_timeout}s)"
-            conn.abort(reason)
-            raise ConnectionClosed(reason) from None
+            # The player isn't reading, and every later send would pile up in
+            # memory behind this one. Drop the link: the reader then marks
+            # the player away, and the outbox still has the message.
+            conn.abort(f"{player_id} stopped reading (send timed out after {self.send_timeout}s)")
+        except ConnectionError:
+            pass   # the link died; the reader reports it, the outbox keeps the message
 
     async def multicast(self, player_ids, msg: dict) -> list[str]:
         """
         Send the same message to a subset of players, concurrently.
-        Returns the ids that could NOT be reached (disconnected/broken).
+        Returns the ids that could NOT be reached (no session).
         """
         player_ids = list(player_ids)
         # gather() runs all sends at once, so one slow player's full socket
@@ -726,7 +1029,7 @@ class Server:
         return [pid for pid, r in zip(player_ids, results) if isinstance(r, Exception)]
 
     async def broadcast(self, msg: dict) -> list[str]:
-        """Send to every connected player."""
+        """Send to every player still in the game."""
         return await self.multicast(self.connected(), msg)
 
     # --- receiving ---------------------------------------------------------
@@ -740,26 +1043,37 @@ class Server:
 
     async def close(self) -> None:
         """
-        Orderly shutdown: stop accepting, hang up on every player, wait for
-        each connection's reader task to finish, then remove the socket
-        files. Anything already passed to send() is still delivered: closing
-        a stream socket (UNIX or TCP) sends EOF/FIN *after* the bytes already
-        queued, never instead of them.
+        Orderly shutdown: stop accepting, tell every live player the session
+        is over (BYE, so it doesn't try to reconnect), hang up, wait for each
+        connection's reader task to finish, then remove the socket files.
+        Anything already sent is still delivered: closing a stream socket
+        sends EOF/FIN *after* the bytes already queued, never instead of them.
         """
+        self._closing = True
         for listener in self._listeners:
             listener.close()                 # no new connections
-        await asyncio.gather(*(conn.close() for conn in list(self._conns.values())))
-        # Connections still in the TLS/HELLO handshake aren't in _conns yet.
+        # Connections still in the TLS/HELLO handshake aren't seated yet.
         # Cancel their tasks: asyncio then closes each one cleanly. (Closing
         # their transports from here instead hits a CPython quirk: a clean
         # close mid-TLS-handshake makes start_tls() *return* -- with no
         # transport -- instead of raising.)
         for task in list(self._handshaking):
             task.cancel()
+        live = []
+        for session in self._sessions.values():
+            if session.expiry is not None:
+                session.expiry.cancel()
+            if session.conn is not None:
+                try:
+                    session.conn.write({"type": BYE})
+                except ConnectionError:
+                    pass
+                live.append(session.conn)
+        await asyncio.gather(*(conn.close() for conn in live))
         for listener in self._listeners:
             try:
-                # Returns once every connection handler (_serve_seat) has
-                # exited. Bounded, so one wedged peer can't hang shutdown.
+                # Returns once every connection handler has exited. Bounded,
+                # so one wedged peer can't hang shutdown.
                 await asyncio.wait_for(listener.wait_closed(), 2)
             except TimeoutError:
                 pass
@@ -776,7 +1090,7 @@ class Server:
 
 class Client:
     """
-    A player's single connection to the moderator.
+    A player's session with the moderator, carried over one link at a time.
 
     Like the Server, the Client reads the socket in a background task and
     puts complete messages into a queue. This matters for timeouts: if
@@ -784,6 +1098,14 @@ class Client:
     4-byte header was consumed but before the body arrived -- the header
     would be lost and every later frame would be misread. Cancelling a
     queue.get() is always safe because frames enter the queue whole.
+
+    If the link breaks (anything but BYE or a protocol error), the same
+    background task reconnects with the session token and both sides replay
+    what the other missed. recv() meanwhile just waits; send() queues. The
+    game sees two extra events in recv():
+        {"type": "_reconnecting", "reason", "resume_timeout"}
+        {"type": "_resumed", "away", "replaying"}
+    and ConnectionClosed only when the session is over for good.
     """
 
     def __init__(self, heartbeat_interval: float = DEFAULT_HEARTBEAT_INTERVAL,
@@ -791,28 +1113,16 @@ class Client:
         _check_heartbeat(heartbeat_interval, heartbeat_misses)
         self.heartbeat_interval = heartbeat_interval
         self.heartbeat_misses = heartbeat_misses
-        self._conn: Connection | None = None
+        self._session: _Session | None = None
+        self._dial = None                    # opens a fresh link (set by connect)
+        self._is_tcp = False
+        self._player_id: str | None = None
+        self._resume_timeout = 0.0           # from WELCOME: how long we may try
         self._inbox: asyncio.Queue = asyncio.Queue()
-        self._reader_task: asyncio.Task | None = None
-        self._heartbeat_task: asyncio.Task | None = None
+        self._task: asyncio.Task | None = None
+        self._done = False
+        self._closing = False                # close() called: don't reconnect
         self._closed_reason = "moderator closed the connection"
-
-    async def _read_loop(self) -> None:
-        try:
-            while True:
-                await self._inbox.put(await self._conn.recv())
-        except ConnectionClosed as e:
-            self._closed_reason = str(e)
-        except Exception as e:
-            # A bug or an error we didn't foresee. Record it rather than
-            # re-raise: nobody awaits this task, so a raised exception would
-            # only surface as a log line at exit.
-            self._closed_reason = f"reader failed: {e!r}"
-        finally:
-            # The sentinel goes in on EVERY exit path -- EOF, garbage frame,
-            # unexpected exception, or cancellation by close(). Without it a
-            # player blocked in recv() would wait forever on a dead link.
-            self._inbox.put_nowait(None)
 
     async def connect(
         self,
@@ -831,7 +1141,7 @@ class Client:
 
         Retries briefly because players may be launched a moment before the
         moderator is listening. These are final and NOT retried:
-          SeatRefused                 (TCP) the moderator turned us down
+          SeatRefused                 the moderator turned us down
           ssl.SSLCertVerificationError  (TCP) the moderator's certificate
                                       isn't from our CA, or doesn't name
                                       `host` -- we may be talking to an
@@ -841,31 +1151,37 @@ class Client:
             raise ValueError("need socket_path (UNIX) or port (TCP)")
         if port is not None and not player_id:
             raise ValueError("TCP needs player_id for the HELLO")
+        self._player_id = player_id
+        self._is_tcp = port is not None
+        if self._is_tcp:
+            host = host or DEFAULT_TCP_HOST
+            self._dial = lambda: self._open_tcp(host, port, player_id, tls_dir)
+        else:
+            self._dial = lambda: self._open_unix(socket_path)
+
         loop = asyncio.get_running_loop()
         deadline = loop.time() + retry_seconds
         while True:
             try:
-                if port is not None:
-                    self._conn = await self._open_tcp(host or DEFAULT_TCP_HOST, port,
-                                                      player_id, tls_dir)
-                else:
-                    reader, writer = await asyncio.open_unix_connection(socket_path)
-                    self._conn = Connection(reader, writer)
-                self._reader_task = asyncio.create_task(self._read_loop())
-                # The player watches the moderator too: if it goes silent,
-                # the link is aborted and recv() raises ConnectionClosed with
-                # the reason, instead of the player waiting forever.
-                self._heartbeat_task = asyncio.create_task(
-                    self._conn.heartbeat(self.heartbeat_interval, self.heartbeat_misses))
-                return
+                conn = await self._dial()
+                break
             except (FileNotFoundError, ConnectionRefusedError, TimeoutError):
                 # Nothing listening (yet), or the connect timed out.
                 if loop.time() >= deadline:
                     raise
                 await asyncio.sleep(0.2)
+        welcome = await self._hello(conn, token=None, ack=0)
+        self._session = _Session(welcome["token"])
+        self._resume_timeout = welcome["resume_timeout"]
+        self._session.attach(conn, welcome["ack"])
+        self._task = asyncio.create_task(self._run(conn))
+
+    async def _open_unix(self, socket_path: str) -> Connection:
+        reader, writer = await asyncio.open_unix_connection(socket_path)
+        return Connection(reader, writer)
 
     async def _open_tcp(self, host: str, port: int, player_id: str, tls_dir: str) -> Connection:
-        """TCP connect + TLS handshake, then HELLO -> WELCOME. Returns the link."""
+        """TCP connect + TLS handshake. Returns the link."""
         tls = _tls_context(player_id, tls_dir, server_side=False)
         # server_hostname=host: check_hostname compares the address we
         # dialled against the SANs in the moderator's certificate.
@@ -874,9 +1190,12 @@ class Client:
                                     ssl_handshake_timeout=CONNECT_TIMEOUT),
             CONNECT_TIMEOUT)
         _tune_tcp(writer)
-        conn = Connection(reader, writer)
+        return Connection(reader, writer)
+
+    async def _hello(self, conn: Connection, token: str | None, ack: int) -> dict:
+        """HELLO -> WELCOME on a fresh link. Returns the WELCOME."""
         try:
-            await conn.send({"type": "HELLO", "player": player_id})
+            conn.write({"type": "HELLO", "player": self._player_id, "token": token, "ack": ack})
             # Read the reply directly, not through the reader task: nothing
             # else may happen on this link until the moderator has said yes.
             # (Cancelling mid-frame is fine here: on timeout we hang up.)
@@ -888,6 +1207,8 @@ class Client:
             raise ConnectionClosed(f"no WELCOME within {HELLO_TIMEOUT}s") from None
         except ConnectionClosed as e:
             conn.abort()
+            if not self._is_tcp:
+                raise
             # Our side of the TLS handshake succeeded, then the moderator
             # hung up before WELCOME. In TLS 1.3 the client's half of the
             # handshake finishes BEFORE the server has checked the client's
@@ -903,16 +1224,127 @@ class Client:
         if reply.get("type") != "WELCOME":
             await conn.close()
             raise SeatRefused(reply.get("text") or f"unexpected {reply.get('type')!r} reply")
-        return conn
+        if (not isinstance(reply.get("token"), str) or not _is_count(reply.get("ack"))
+                or not isinstance(reply.get("resume_timeout"), (int, float))
+                or reply.get("resumed") is not (token is not None)):
+            conn.abort()
+            raise ProtocolError(f"malformed WELCOME {reply}")
+        return reply
+
+    async def _run(self, conn: Connection) -> None:
+        """
+        The background task for the whole session: read the current link;
+        when it breaks, reconnect and resume; repeat until the session ends.
+        """
+        try:
+            while True:
+                reason, final = await self._pump(conn)
+                if final or self._closing or self._resume_timeout <= 0:
+                    self._closed_reason = reason
+                    return
+                lost_at = time.monotonic()
+                self._inbox.put_nowait({"type": "_reconnecting", "reason": reason,
+                                        "resume_timeout": self._resume_timeout})
+                resumed = await self._resume(reason)
+                if resumed is None:
+                    return          # _resume recorded why
+                conn, welcome = resumed
+                self._session.attach(conn, welcome["ack"])
+                self._inbox.put_nowait({"type": "_resumed",
+                                        "away": round(time.monotonic() - lost_at, 2),
+                                        "replaying": welcome["replaying"]})
+        except ProtocolError as e:      # e.g. a bad ack in the WELCOME
+            self._closed_reason = str(e)
+        except Exception as e:
+            # A bug or an error we didn't foresee. Record it rather than
+            # re-raise: nobody awaits this task, so a raised exception would
+            # only surface as a log line at exit.
+            self._closed_reason = f"reader failed: {e!r}"
+        finally:
+            self._done = True
+            if self._session is not None and self._session.conn is not None:
+                self._session.conn.abort()
+                self._session.conn = None
+            # The sentinel goes in on EVERY exit path -- BYE, garbage frame,
+            # failed resume, unexpected exception, or cancellation by close().
+            # Without it a player blocked in recv() would wait forever.
+            self._inbox.put_nowait(None)
+
+    async def _pump(self, conn: Connection) -> tuple[str, bool]:
+        """Read one link until it fails. Returns (reason, final?)."""
+        session = self._session
+        # The player watches the moderator too: if it goes silent, the link
+        # is aborted and recv() below raises with the reason.
+        heartbeat = asyncio.create_task(conn.heartbeat(
+            self.heartbeat_interval, self.heartbeat_misses, ack=lambda: session.in_seq))
+        try:
+            while True:
+                frame = await conn.recv()
+                if frame.get("type") == BYE:
+                    return "the moderator ended the session", True
+                msg = session.on_frame(frame)
+                if msg is not None:
+                    self._inbox.put_nowait(msg)
+        except ProtocolError as e:
+            return str(e), True
+        except ConnectionClosed as e:
+            return str(e), False
+        finally:
+            heartbeat.cancel()
+            if session.conn is conn:
+                session.conn = None
+            conn.abort()    # it's dead (or done); nothing left worth flushing
+            await asyncio.gather(heartbeat, return_exceptions=True)
+
+    async def _resume(self, reason: str):
+        """
+        Keep redialling until the moderator takes us back, the window runs
+        out, or it refuses. Returns (conn, welcome) or None.
+        """
+        deadline = time.monotonic() + self._resume_timeout
+        delay = 0.2
+        while True:
+            try:
+                conn = await self._dial()
+                welcome = await self._hello(conn, self._session.token, self._session.in_seq)
+                return conn, welcome
+            except (SeatRefused, ssl.SSLCertVerificationError, ProtocolError) as e:
+                # A definite no (e.g. our session already expired), or a
+                # moderator we mustn't trust: retrying won't change that.
+                self._closed_reason = f"could not resume: {e}"
+                return None
+            except (OSError, TimeoutError):
+                pass   # not reachable yet: refused, unreachable, timed out, reset
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._closed_reason = (f"could not reconnect within "
+                                       f"{self._resume_timeout:g}s (lost: {reason})")
+                return None
+            # Exponential backoff, capped: quick retries for a blip, without
+            # hammering a moderator that is down for longer.
+            await asyncio.sleep(min(delay, remaining))
+            delay = min(delay * 2, 2.0)
 
     async def send(self, msg: dict) -> None:
-        await self._conn.send(msg)
+        """
+        Send one message. While reconnecting it is queued and sent on resume;
+        raises ConnectionClosed only once the session is over.
+        """
+        if self._done or self._session is None:
+            raise ConnectionClosed(self._closed_reason)
+        self._session.send(msg)
+        conn = self._session.conn
+        if conn is not None:
+            try:
+                await conn.drain()
+            except ConnectionError:
+                pass   # the link died; the message waits in the outbox
 
     async def recv(self, timeout: float | None = None) -> dict:
         """
-        Next message from the moderator.
-        Raises TimeoutError if `timeout` expires, ConnectionClosed if the
-        moderator hung up.
+        Next message from the moderator (or a _reconnecting / _resumed event).
+        Raises TimeoutError if `timeout` expires, ConnectionClosed once the
+        session is over.
         """
         msg = await asyncio.wait_for(self._inbox.get(), timeout)
         if msg is None:
@@ -921,11 +1353,23 @@ class Client:
         return msg
 
     async def close(self) -> None:
-        tasks = [t for t in (self._reader_task, self._heartbeat_task) if t is not None]
-        for task in tasks:
-            task.cancel()
-        # Wait for the cancellations to finish so no task is left dangling
-        # ("Task was destroyed but it is pending!").
-        await asyncio.gather(*tasks, return_exceptions=True)
-        if self._conn is not None:
-            await self._conn.close()
+        """
+        Leave for good: BYE (so the moderator ends our session at once rather
+        than holding the seat for a resume), then stop the background task.
+        """
+        # Set first: closing the link below wakes our own reader with an EOF,
+        # which must end the session, not start a reconnect.
+        self._closing = True
+        self._closed_reason = "closed"
+        conn = self._session.conn if self._session is not None else None
+        if conn is not None and not self._done:
+            try:
+                conn.write({"type": BYE})
+                await conn.close()      # graceful: lets the BYE get out first
+            except ConnectionError:
+                pass
+        if self._task is not None:
+            self._task.cancel()
+            # Wait for the cancellation to finish so no task is left dangling
+            # ("Task was destroyed but it is pending!").
+            await asyncio.gather(self._task, return_exceptions=True)

@@ -131,7 +131,8 @@ The seat name must match the Linux user. With `--peercred`, the moderator reject
 | `--vote-timeout` | 30 | Seconds to vote; anyone silent abstains |
 | `--max-rounds` | 20 | The game is a draw after this many night+day rounds |
 | `--heartbeat` | 2 | Seconds between the moderator's heartbeats |
-| `--heartbeat-misses` | 3 | Drop a player that has been silent for this many of *its* heartbeat intervals |
+| `--heartbeat-misses` | 3 | Treat a player's link as dead after this many of *its* heartbeat intervals of silence |
+| `--resume-timeout` | 120 | Seconds to hold a disconnected player's seat (and keep its messages) for it to reconnect. `0` = no reconnecting, as in Project 1. |
 | `--local` | off | Development only: create the seat directories yourself (see below) |
 
 | `player.py` flag | Meaning |
@@ -257,20 +258,30 @@ Each message on the wire is one frame:
 | `DEFAULT_SEND_TIMEOUT = 5.0` | Default for `Server(send_timeout=...)` |
 | `CLOSE_TIMEOUT = 2.0` | How long `close()` waits for buffered data to flush before aborting |
 | `DEFAULT_HEARTBEAT_INTERVAL = 2.0`, `DEFAULT_HEARTBEAT_MISSES = 3`, `MAX_HEARTBEAT_INTERVAL = 60.0` | Heartbeat defaults, and the largest interval a peer may announce |
+| `DEFAULT_RESUME_TIMEOUT = 120.0`, `MAX_OUTBOX = 1000` | How long an away player's seat is held; how many unacknowledged messages a session may hold |
+| `DATA = "DATA"`, `BYE = "BYE"` | Reserved types: the envelope every game message travels in, and "this session is over on purpose" |
 | `HEARTBEAT = "HEARTBEAT"` | Reserved message type: commslib sends and consumes these itself, and they're never delivered to the game |
 
 ### `class Server`: the moderator's side
 
-Create one with `server = Server(send_timeout=5.0, heartbeat_interval=2.0, heartbeat_misses=3)`. Every seated connection sends a heartbeat every `heartbeat_interval` seconds, and is dropped (`_disconnected`, reason `no heartbeat ...`) if nothing arrives from it for `heartbeat_misses` of the intervals *it* announced. `ValueError` if the interval isn't in (0, 60] or misses < 1. Methods:
+Create one with `server = Server(send_timeout=5.0, heartbeat_interval=2.0, heartbeat_misses=3, resume_timeout=120.0)`.
+
+- **Heartbeats:** every live link sends a heartbeat every `heartbeat_interval` seconds. It is declared dead (reason `no heartbeat ...`) if nothing arrives on it for `heartbeat_misses` of the intervals *it* announced.
+- **Sessions:** each seat has a *session* that outlives its links. When a link dies the player is *away* (`_away`): its seat is held and messages to it are kept, for `resume_timeout` seconds, while the player reconnects with its session token. It then gets everything it missed, in order, exactly once (`_resumed`). Only if it doesn't come back, quits (`BYE`) or breaks the protocol does the session end (`_disconnected`). The protocol is in [DISTRIBUTED.md](DISTRIBUTED.md#resume).
+- **Errors:** `ValueError` if the interval isn't in (0, 60], misses < 1, or `resume_timeout` < 0.
+
+Methods:
 
 | Method | Description |
 |---|---|
 | `await start(player_ids, base_dir="/run/werewolf", check_peer_uid=False, *, host=None, port=None, tls_dir="/etc/werewolf/tls")` | **With `port`:** one TCP + mutual-TLS listener on `host:port` (`host` defaults to `127.0.0.1`; `port=0` picks a free port, readable afterwards as `server.port`), using `tls_dir`'s CA and moderator certificate. It raises `OSError` if those can't be loaded. A connection is seated by the CN of its client certificate; certificates not signed by the CA, for no seat, or for a different seat than the `HELLO` names are refused. `base_dir` is ignored, and `check_peer_uid=True` raises `ValueError` (SO_PEERCRED is UNIX-only). **Without `port`:** opens a listening socket at `<base_dir>/<id>/sock` for each id and sets it to mode `0660`. A stale socket file left over from a crash is removed first. **The seat directories must already exist** (`setup_users.sh` creates them); raises `FileNotFoundError` if one is missing. With `check_peer_uid=True`, each `player_id` must be a Linux username (`KeyError` otherwise), and connections whose SO_PEERCRED uid doesn't match are rejected. |
-| `await wait_for_players(timeout=None)` | Returns once every seat has a connection. Raises `TimeoutError` if `timeout` seconds pass first. |
-| `connected() -> list[str]` | The ids currently connected (*not* a coroutine) |
-| `await send_to(player_id, msg: dict)` | **1:1**: send to one player. Raises `KeyError` if that player isn't connected. If the player doesn't make room for the message within `send_timeout` seconds (a stopped or wedged process), the server drops that connection, the reader posts `_disconnected`, and this raises `ConnectionClosed`. |
-| `await multicast(player_ids, msg: dict) -> list[str]` | **Multicast**: send the same message to a subset of players, **concurrently**. A failed send to one player doesn't stop the others. Returns the ids that could not be reached. |
-| `await broadcast(msg: dict) -> list[str]` | **Broadcast**: `multicast` to every connected player. Returns the unreachable ids. |
+| `await wait_for_players(timeout=None)` | Returns once every seat has a session. Raises `TimeoutError` if `timeout` seconds pass first. |
+| `connected() -> list[str]` | Seats still in the game: live, *or away and resumable* (messages to them are kept and replayed). Not a coroutine. |
+| `live() -> list[str]` | Seats with a working link right now |
+| `lock_roster()` | Call when the game starts. From then on, a seat whose session has ended can't be taken by a fresh session, because the fresh one would lack what the old one was sent (its role). Before it, a player who left the lobby can join again. |
+| `await send_to(player_id, msg: dict)` | **1:1**: send to one player. The message is numbered and kept until the player acknowledges it, so it isn't lost if the link breaks. While the player is away it waits and is replayed on return. If the player doesn't make room for it within `send_timeout` seconds (a stopped or wedged process), the link is dropped and the player becomes away; the message is still kept. Raises `KeyError` if the seat has no session (never joined, or ended), and `ConnectionClosed` if an away player has fallen `MAX_OUTBOX` messages behind, in which case its session is ended. |
+| `await multicast(player_ids, msg: dict) -> list[str]` | **Multicast**: send the same message to a subset of players, **concurrently**. A failed send to one player doesn't stop the others. Returns the ids that could not be reached (no session). |
+| `await broadcast(msg: dict) -> list[str]` | **Broadcast**: `multicast` to every player still in the game (`connected()`). Returns the unreachable ids. |
 | `await recv_any(timeout=None) -> (player_id, msg)` | Next message from **any** player, in arrival order. Raises `TimeoutError` if nothing arrives within `timeout` seconds. |
 | `await close()` | Stops accepting, closes every connection, waits (2s limit) for the per-connection tasks to finish, and deletes the socket files. Messages already sent are still delivered before the connection closes. |
 
@@ -278,24 +289,34 @@ Create one with `server = Server(send_timeout=5.0, heartbeat_interval=2.0, heart
 
 | `msg["type"]` | Meaning |
 |---|---|
-| `"_connected"` | That player has taken its seat |
-| `"_disconnected"` | That player's connection closed; `msg["reason"]` says why |
-| `"_rejected"` | A connection was refused; `msg["reason"]` says why: SO_PEERCRED mismatch (`msg["uid"]` holds the uid), seat already taken (under that seat), or (TCP, under player id `None`) a failed TLS handshake (no certificate, wrong CA, not TLS) or a certificate for no seat / for a different seat than the `HELLO`. |
+| `"_connected"` | That player has taken its seat (a new session) |
+| `"_away"` | Its link broke (`msg["reason"]`). The seat is held for `msg["resume_timeout"]` seconds; it is still in `connected()`, and messages to it are kept. |
+| `"_resumed"` | It reconnected after `msg["away"]` seconds; `msg["replayed"]` messages were resent to it |
+| `"_disconnected"` | Its session is over for good; `msg["reason"]` says why (`left the game`, `did not come back within ...`, a protocol error, ...) |
+| `"_rejected"` | A connection was refused; `msg["reason"]` says why: SO_PEERCRED mismatch (`msg["uid"]` holds the uid), seat already taken, a wrong or expired session token (all under that seat), or (TCP, under player id `None`) a failed TLS handshake (no certificate, wrong CA, not TLS) or a certificate for no seat / for a different seat than the `HELLO`. |
 
-**What the server sends on its own** (the game never needs to): if a second connection arrives for an occupied seat, or a uid check fails, the server sends that connection `{"type": "error", "text": ...}` and closes it.
+**What the server sends on its own** (the game never needs to): `WELCOME`, heartbeats, acks and replays; `BYE` at `close()`; and `{"type": "error", "text": ...}` to a connection it refuses, before closing it.
 
 **How it works:** each accepted connection gets its own reader task. All the reader tasks put complete messages into one shared `asyncio.Queue`, and `recv_any(timeout)` is `asyncio.wait_for(queue.get(), timeout)`. The moderator therefore never blocks on any single player.
 
 ### `class Client`: a player's side
 
-Create one with `client = Client(heartbeat_interval=2.0, heartbeat_misses=3)`. Heartbeats work as for the `Server`: if the moderator goes silent for too long, `recv()` raises `ConnectionClosed("no heartbeat ...")`. Methods:
+Create one with `client = Client(heartbeat_interval=2.0, heartbeat_misses=3)`.
+
+**Reconnecting:** if the link breaks (anything except `BYE` or a protocol error), the client reconnects **by itself** with its session token, for as long as the moderator's `resume_timeout` allows. Both sides then replay what the other missed. Meanwhile `recv()` waits and `send()` queues. `recv()` also returns two events, which the game can print:
+- `{"type": "_reconnecting", "reason", "resume_timeout"}`;
+- `{"type": "_resumed", "away", "replaying"}`, after which the missed messages follow.
+
+`ConnectionClosed` comes only once the session is over.
+
+Methods:
 
 | Method | Description |
 |---|---|
 | `await connect(socket_path=None, retry_seconds=10.0, *, host=None, port=None, player_id=None, tls_dir="/etc/werewolf/tls")` | Connect to the moderator: over UNIX at `socket_path`, or, with `port`, over TCP + TLS to `host:port` as `player_id`, presenting `tls_dir/<player_id>/` and trusting only `tls_dir/ca.crt`. Retries every 0.2s while nothing is listening yet (the moderator may still be starting), for up to `retry_seconds`. These are raised immediately: `PermissionError` (UNIX: wrong user for this seat; TCP: can't read our key), `SeatRefused` (TCP: the moderator refused us), `ssl.SSLCertVerificationError` (TCP: **we** refused the moderator: wrong CA, or `host` not in its certificate). |
-| `await send(msg: dict)` | Send one message to the moderator |
-| `await recv(timeout=None) -> dict` | Next message from the moderator. Raises `TimeoutError` if `timeout` expires, or `ConnectionClosed` if the link is gone for any reason (including a malformed frame). It never hangs on a dead link. |
-| `await close()` | Stop the background reader and close the connection |
+| `await send(msg: dict)` | Send one message to the moderator (numbered and kept until acknowledged; queued while reconnecting). Raises `ConnectionClosed` only once the session is over. |
+| `await recv(timeout=None) -> dict` | Next message from the moderator, or a `_reconnecting` / `_resumed` event. Raises `TimeoutError` if `timeout` expires, or `ConnectionClosed` once the session is over: `BYE` from the moderator, a protocol error, a refused or timed-out resume. It never hangs on a dead link. |
+| `await close()` | Leave for good: send `BYE` (so the moderator ends the session at once instead of holding the seat), then stop the background task |
 
 The Client also reads in a background task that feeds a queue. As a result, a `recv(timeout)` that times out can never cut a frame in half.
 
@@ -303,10 +324,12 @@ The Client also reads in a background task that feeds a queue. As a result, a `r
 
 | Method | Description |
 |---|---|
-| `await send(msg: dict)` | Frame and send one message, then wait until the OS has accepted the bytes (`drain()`). Raises `TypeError` if `msg` isn't a dict, and `ValueError` if it's over 1 MiB. A lock stops concurrent sends from interleaving their bytes. |
-| `await recv() -> dict` | Return the next frame that isn't a `HEARTBEAT` (those are consumed here; every frame updates `last_heard`). Raises `ConnectionClosed` on EOF or any socket error, and `ProtocolError` on an oversized or malformed frame or a bad heartbeat interval. |
+| `write(msg: dict)` | Frame one message and hand it to the transport in a single synchronous call. No other task can run in the middle, so frames never interleave and no lock is needed. Raises `TypeError` if `msg` isn't a dict, `ValueError` if it's over 1 MiB, and `ConnectionClosed` if the link is already closing. |
+| `await drain()` | Wait until the OS has room for what was written |
+| `await send(msg: dict)` | `write()` then `drain()` |
+| `await recv() -> dict` | The next frame, whatever its type. Every frame updates `last_heard`; a `HEARTBEAT`'s interval is checked here. Raises `ConnectionClosed` on EOF or any socket error, and `ProtocolError` on an oversized or malformed frame or a bad heartbeat interval. |
 | `abort(reason=None)` | Drop the link immediately, discarding unsent data. `reason` becomes the message of the `ConnectionClosed` that the reader then gets. |
-| `await heartbeat(interval, misses)` | Run as a task for the life of the link: send `HEARTBEAT` every `interval` s, and `abort()` if nothing arrives for `misses ×` the peer's interval. `Server` and `Client` start it for you. |
+| `await heartbeat(interval, misses, ack)` | Run as a task for the life of the link: send `HEARTBEAT` (carrying `ack()`) every `interval` s, and `abort()` if nothing arrives for `misses ×` the peer's interval. `Server` and `Client` start it for you. |
 | `await close()` | Close the link, waiting up to `CLOSE_TIMEOUT` for unsent data to flush, then aborting |
 
 ### Minimal example
@@ -372,8 +395,8 @@ The game's own message types (`ROLE_ASSIGN`, `NIGHT_PROMPT`, `CHAT`, `VOTE_TALLY
 | `test_no_role_leak.py` | Automated: plays full games and checks that villagers never receive anyone else's role |
 | `test_night.py` | Automated: night phase, including the timeout for silent players and the Doctor rule |
 | `test_day.py` | Automated: chat relay, voting, ties, spectators |
-| `test_game.py` | Automated: whole games, win conditions, clean shutdown on signals, a frozen (`SIGSTOP`) player dropped by heartbeat |
-| `test_commslib.py` | Automated: commslib failure paths (malformed frames, a stuck reader, a dead link) on both transports, the TCP/TLS handshake and socket options, and heartbeats (idle link kept, silent peer dropped, black-holed link noticed by both ends) |
+| `test_game.py` | Automated: whole games, win conditions, clean shutdown on signals; a frozen (`SIGSTOP`) player marked away, then resuming with exactly the messages everyone else got; one frozen past the resume window, dropped for good |
+| `test_commslib.py` | Automated: commslib failure paths (malformed frames, a stuck reader, a dead link) on both transports, the TCP/TLS handshake and socket options, heartbeats (idle link kept, silent peer dropped, black-holed link noticed by both ends), and sessions (replay after a partition in both directions, takeover, duplicate suppression, token refusals, expiry, `BYE`, lobby rejoin, outbox limit) |
 | `testnet.py` | Test helper: `WW_TRANSPORT=tcp` makes the process-launching tests use TCP |
 | `DISTRIBUTED.md` | Project 2 protocol: transports, certificates, handshake, socket options, failure model |
 | `ARCHITECTURE.md` | Design document: diagram, framing, permissions, message table, concurrency |

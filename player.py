@@ -256,6 +256,13 @@ def handle(msg: dict, state: PlayerState) -> str:
             lines.append(f"* {'You WON!' if won else 'You lost.'}")
         return "\n".join(lines)
 
+    if kind == "_reconnecting":
+        return (f"* Lost the link to the moderator ({msg['reason']}). "
+                f"Reconnecting for up to {msg['resume_timeout']:g}s; "
+                "anything you type is sent when we're back.")
+    if kind == "_resumed":
+        return (f"* Reconnected after {msg['away']}s. "
+                f"Catching up on {msg['replaying']} missed message(s):")
     if kind == "INFO":
         return f"* {msg['text']}"
     if kind == "error":

@@ -9,7 +9,9 @@ Real processes (moderator + bot players, no sudo). Checks that:
   - all socket files are gone afterwards
   - SIGTERM / Ctrl-C on the moderator still ends the game cleanly
   - a player killed mid-game doesn't break anything for the others
-  - a player frozen mid-game (SIGSTOP) is dropped by heartbeat within the limit
+  - a player frozen mid-game (SIGSTOP) is marked away within the heartbeat
+    limit, and resumes when thawed with exactly the messages everyone else got
+  - a player frozen past --resume-timeout is dropped for good and refused
 """
 
 import json
@@ -64,6 +66,12 @@ class Run:
                     return stamp
             time.sleep(0.05)
         raise AssertionError(f"moderator never logged {text!r}:\n" + self.mod_out())
+
+    def received(self, who: str) -> list[dict]:
+        """Everything `who` has logged so far."""
+        if not os.path.exists(self.logs[who]):
+            return []
+        return [json.loads(l) for l in open(self.logs[who]) if l.strip()]
 
     def mod_out(self) -> str:
         return "".join(line for _, line in self.mod_lines)
@@ -175,39 +183,96 @@ def test_player_killed_midgame():
           f"'{received[others[0]][-1]['text']}'")
 
 
-def test_player_frozen_midgame():
+# Broadcasts every seat gets, dead or alive, in the same order. A player that
+# lost its link must end up with exactly the same sequence as everyone else.
+BROADCASTS = ("PHASE", "DAY_ANNOUNCE", "VOTE_TALLY", "GAME_OVER")
+
+
+def broadcasts(log: list[dict]) -> list[str]:
+    return [json.dumps(m, sort_keys=True) for m in log if m["type"] in BROADCASTS]
+
+
+def test_player_partitioned_resumes():
     """
     SIGSTOP freezes p3's process but not its kernel: the TCP connection stays
-    up, keepalive probes are answered, nothing is ever reset. Only the
-    missing heartbeats show that the program is gone.
+    up, keepalive probes are answered, nothing is ever reset. Only missing
+    heartbeats show that the program is gone. The moderator marks it away
+    and keeps its messages; thawed, p3 reconnects and catches up.
     """
     players = [f"p{i}" for i in range(1, 7)]
     beat, misses = 0.5, 3
     limit = beat * misses
+    # A 3s discussion: the game can't be over before the heartbeat limit.
+    timers = ["--night-timeout", "5", "--discussion", "3", "--vote-timeout", "3"]
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        run = Run(tmp, players, 1, FAST + ["--heartbeat", str(beat)],
+        run = Run(tmp, players, 1, timers + ["--heartbeat", str(beat)],
                   player_extra=["--heartbeat", str(beat), "--heartbeat-misses", str(misses)])
         run.wait_for("PHASE", "p3")
         run.procs["p3"].send_signal(signal.SIGSTOP)
         frozen_at = time.monotonic()
-        dropped_at = run.wait_for_log("p3 disconnected")
+        away_at = run.wait_for_log("p3 is away")
+        # Stay frozen until a phase has started SINCE p3 went away, so there
+        # is definitely something waiting for it when it comes back.
+        seen = len(run.received("p1"))
+        end = time.monotonic() + 20
+        while not any(m["type"] == "PHASE" for m in run.received("p1")[seen:]):
+            assert time.monotonic() < end, "the game never moved on"
+            time.sleep(0.05)
+        run.procs["p3"].send_signal(signal.SIGCONT)
+        run.wait_for_log("p3 is back")
+        out, codes, received = run.finish()
+
+    detected = away_at - frozen_at
+    assert run.mod.returncode == 0, out
+    assert detected < limit + 0.5, f"took {detected:.2f}s to notice (limit {limit}s)"
+    assert "p3 disconnected" not in out, out
+    back = next(l for l in out.splitlines() if "p3 is back" in l)
+    replayed = int(back.split("replayed ")[1].split()[0])
+    assert replayed > 0, back
+    kinds = [m["type"] for m in received["p3"]]
+    assert "_reconnecting" in kinds and "_resumed" in kinds, kinds
+    # Exactly what everyone else got: nothing lost, nothing twice.
+    for p in players:
+        assert broadcasts(received[p]) == broadcasts(received["p1"]), (
+            f"{p}'s broadcasts differ from p1's")
+        assert received[p][-1]["type"] == "GAME_OVER", f"{p} never saw the end"
+    for p, (code, err) in codes.items():
+        assert code == 0, f"{p} exited {code}:\n{err}"
+    print(f"PASS p3 frozen mid-night: away after {detected:.2f}s (limit {limit}s), "
+          f"{back.split('] ', 1)[1]}; its {len(broadcasts(received['p3']))} broadcasts "
+          f"match every other player's exactly")
+
+
+def test_player_gone_too_long():
+    """Frozen for longer than --resume-timeout: the session ends for good, and
+    the thawed player is turned away when it tries to resume."""
+    players = [f"p{i}" for i in range(1, 7)]
+    beat, resume = 0.5, 2.0
+    # A 5s discussion: the game outlasts the limit plus the resume window.
+    timers = ["--night-timeout", "5", "--discussion", "5", "--vote-timeout", "3"]
+    with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
+        run = Run(tmp, players, 1,
+                  timers + ["--heartbeat", str(beat), "--resume-timeout", str(resume)],
+                  player_extra=["--heartbeat", str(beat)])
+        run.wait_for("PHASE", "p3")
+        run.procs["p3"].send_signal(signal.SIGSTOP)
+        away_at = run.wait_for_log("p3 is away")
+        gone_at = run.wait_for_log("p3 disconnected")
         run.procs["p3"].send_signal(signal.SIGCONT)
         out, codes, received = run.finish()
 
-    detected = dropped_at - frozen_at
+    held = gone_at - away_at
     line = next(l for l in out.splitlines() if "p3 disconnected" in l)
     assert run.mod.returncode == 0, out
-    assert "no heartbeat" in line, line
-    # The heartbeat bound, plus a little for process scheduling.
-    assert detected < limit + 0.5, f"took {detected:.2f}s to notice (limit {limit}s)"
+    assert "did not come back within" in line, line
+    assert resume - 0.2 < held < resume + 0.5, f"seat held {held:.2f}s, expected {resume}s"
+    assert "rejected a connection for p3: unknown or expired session token" in out, out
+    assert codes["p3"][0] == 0, f"p3 exited {codes['p3']}"
     others = [p for p in players if p != "p3"]
     for p in others:
         assert received[p][-1]["type"] == "GAME_OVER", f"{p} never saw the end"
-    # Thawed, p3 finds its link already dropped and exits cleanly by itself.
-    assert codes["p3"][0] == 0, f"p3 exited {codes['p3']}"
-    print(f"PASS player p3 frozen (SIGSTOP) mid-game: dropped after {detected:.2f}s "
-          f"(limit {limit}s), logged as '{line.split('] ', 1)[1]}'; the game finished; "
-          f"thawed p3 exited 0")
+    print(f"PASS p3 frozen past the {resume:g}s resume window: seat held {held:.2f}s, then "
+          f"'{line.split('] ', 1)[1]}'; thawed p3 was refused and exited 0")
 
 
 if __name__ == "__main__":
@@ -216,5 +281,6 @@ if __name__ == "__main__":
     test_moderator_signal(signal.SIGTERM, "SIGTERM")
     test_moderator_signal(signal.SIGINT, "SIGINT (Ctrl-C)")
     test_player_killed_midgame()
-    test_player_frozen_midgame()
+    test_player_partitioned_resumes()
+    test_player_gone_too_long()
     print("all game tests passed")

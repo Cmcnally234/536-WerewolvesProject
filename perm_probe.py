@@ -17,7 +17,7 @@ import os
 import pwd
 import sys
 
-from commslib import Client, ConnectionClosed, player_socket_path
+from commslib import Client, ConnectionClosed, SeatRefused, player_socket_path
 
 ACCEPTED, DENIED, REJECTED, OTHER = 0, 2, 3, 4
 
@@ -31,6 +31,11 @@ async def probe(seat: str, base_dir: str) -> int:
     except PermissionError as e:
         print(f"DENIED    {me} -> {path}: {e}")
         return DENIED
+    except SeatRefused as e:
+        # The socket let us in, but the moderator refused the seat in the
+        # HELLO/WELCOME handshake (e.g. the SO_PEERCRED uid check).
+        print(f"REJECTED  {me} -> {path}: {e}")
+        return REJECTED
     except OSError as e:
         print(f"OTHER     {me} -> {path}: {e!r}")
         return OTHER

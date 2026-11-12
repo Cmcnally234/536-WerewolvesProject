@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 
 import roles
 from commslib import (DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_HEARTBEAT_MISSES,
-                      DEFAULT_TLS_DIR, Server)
+                      DEFAULT_RESUME_TIMEOUT, DEFAULT_TLS_DIR, Server)
 
 
 def log(text: str) -> None:
@@ -46,6 +46,15 @@ def log(text: str) -> None:
 
 def log_rejected(pid: str | None, msg: dict) -> None:
     log(f"rejected a connection{f' for {pid}' if pid else ''}: {msg.get('reason')}")
+
+
+def log_away(pid: str, msg: dict) -> None:
+    log(f"{pid} is away ({msg.get('reason')}); holding the seat for "
+        f"{msg.get('resume_timeout'):g}s")
+
+
+def log_resumed(pid: str, msg: dict) -> None:
+    log(f"{pid} is back after {msg.get('away')}s; replayed {msg.get('replayed')} messages")
 
 
 @dataclass
@@ -148,6 +157,12 @@ class Game:
             return True    # leftover join notice from the lobby
         if kind == "_rejected":
             log_rejected(pid, msg)
+            return True
+        if kind == "_away":
+            log_away(pid, msg)
+            return True    # still in the game: still pending, still sent to
+        if kind == "_resumed":
+            log_resumed(pid, msg)
             return True
         if kind == "_disconnected":
             log(f"{pid} disconnected ({msg.get('reason')})")
@@ -520,6 +535,10 @@ async def lobby(server: Server, players: list[str], timeout: float) -> bool:
             log(f"{pid} left the lobby ({msg.get('reason')})")
         elif kind == "_rejected":
             log_rejected(pid, msg)
+        elif kind == "_away":
+            log_away(pid, msg)       # still joined: the seat is being held
+        elif kind == "_resumed":
+            log_resumed(pid, msg)
         else:
             try:
                 await server.send_to(pid, {"type": "error", "text": "The game hasn't started yet."})
@@ -536,6 +555,9 @@ async def session(server: Server, args, holder: dict) -> int:
         log(f"gave up waiting for {missing}")
         return 1
     log("everyone is here")
+    # Roles are about to be dealt: from now on a seat that's lost for good
+    # can't be refilled by a fresh session that never got its role.
+    server.lock_roster()
     timers = Timers(args.night_timeout, args.discussion, args.vote_timeout)
     holder["game"] = game = Game(server, args.players, args.seed, timers)
     await game.run(args.max_rounds)
@@ -557,6 +579,9 @@ async def main() -> int:
     parser.add_argument("--heartbeat-misses", type=int, default=DEFAULT_HEARTBEAT_MISSES,
                         help="drop a player silent for this many of its heartbeat "
                              "intervals (default %(default)s)")
+    parser.add_argument("--resume-timeout", type=float, default=DEFAULT_RESUME_TIMEOUT,
+                        help="seconds to hold a disconnected player's seat for it to "
+                             "reconnect; 0 = no reconnecting (default %(default)s)")
     parser.add_argument("--peercred", action="store_true",
                         help="enforce SO_PEERCRED (player ids must be Linux users)")
     parser.add_argument("--seed", type=int, help="fix the role shuffle")
@@ -584,7 +609,8 @@ async def main() -> int:
 
     try:
         server = Server(heartbeat_interval=args.heartbeat,
-                        heartbeat_misses=args.heartbeat_misses)
+                        heartbeat_misses=args.heartbeat_misses,
+                        resume_timeout=args.resume_timeout)
     except ValueError as e:
         print(e, file=sys.stderr)
         return 2
