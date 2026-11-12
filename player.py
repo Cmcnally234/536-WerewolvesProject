@@ -297,10 +297,14 @@ def parse_target(arg: str, targets: list[str]) -> str | None:
 # ---------------------------------------------------------------------------
 
 class Bot:
-    def __init__(self, client: Client, state: PlayerState, mode: str):
+    def __init__(self, client: Client, state: PlayerState, mode: str, think: float = 0.0):
         self.client = client
         self.state = state
         self.mode = mode
+        # Extra seconds before every action, on top of the short random
+        # pause. Gives a demo (or a fault-injection test) a predictable
+        # window between "the prompt arrived" and "the bot answered".
+        self.think = think
         self.rng = random.Random()
 
     async def react(self, msg: dict) -> None:
@@ -308,19 +312,19 @@ class Bot:
             return   # silent: exercises the moderator's timeout path
         kind = msg.get("type")
         if kind == "PHASE" and msg["phase"] == "day":
-            await asyncio.sleep(self.rng.uniform(0.0, 0.3))
+            await asyncio.sleep(self.think + self.rng.uniform(0.0, 0.3))
             suspect = self.rng.choice([p for p in self.state.alive_players if p != self.state.name])
             await self.client.send({"type": "CHAT", "text": f"I don't trust {suspect}."})
             return
         if kind == "PHASE" and msg["phase"] == "vote":
-            await asyncio.sleep(self.rng.uniform(0.1, 0.4))
+            await asyncio.sleep(self.think + self.rng.uniform(0.1, 0.4))
             # Wolves never vote for their packmate; everyone else votes at random.
             options = [p for p in self.state.candidates if p not in self.state.teammates]
             await self.client.send({"type": "VOTE", "target": self.rng.choice(options) if options else None})
             return
         if kind == "NIGHT_PROMPT":
             # Think for a moment, like a human would.
-            await asyncio.sleep(self.rng.uniform(0.1, 0.6))
+            await asyncio.sleep(self.think + self.rng.uniform(0.1, 0.6))
             target = self.rng.choice(msg["targets"])
             if "pack" in msg:
                 # If a packmate already voted, back them up.
@@ -438,6 +442,8 @@ async def main() -> int:
                         help="give up on a moderator silent for this many of its "
                              "heartbeat intervals (default %(default)s)")
     parser.add_argument("--log", help="append every received message (JSON lines) to this file")
+    parser.add_argument("--bot-think", type=float, default=0.0, metavar="SECONDS",
+                        help="bots: wait this much longer before every action")
     parser.add_argument("--bot", nargs="?", const="act", choices=["act", "silent"],
                         help="no keyboard; play automatically (act) or never respond (silent)")
     parser.add_argument("--wait", type=float, default=30.0,
@@ -460,7 +466,7 @@ async def main() -> int:
 
     state = PlayerState(args.name)
     term = Terminal()
-    bot = Bot(client, state, args.bot) if args.bot else None
+    bot = Bot(client, state, args.bot, args.bot_think) if args.bot else None
     tasks = [asyncio.create_task(socket_loop(client, term, state, args.log, bot))]
     if not bot:
         term.start()

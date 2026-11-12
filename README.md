@@ -140,6 +140,7 @@ The seat name must match the Linux user. With `--peercred`, the moderator reject
 | `--heartbeat` | 2 | Seconds between the moderator's heartbeats |
 | `--heartbeat-misses` | 3 | Treat a player's link as dead after this many of *its* heartbeat intervals of silence |
 | `--resume-timeout` | 120 | Seconds to hold a disconnected player's seat (and keep its messages) for it to reconnect. `0` = no reconnecting, as in Project 1. |
+| `--linger` | 30 | After the game, wait up to this long until every player has acknowledged the result: a player reconnecting at that moment, or a slow lossy link, still gets `GAME_OVER` |
 | `--local` | off | Development only: create the seat directories yourself (see below) |
 
 | `player.py` flag | Meaning |
@@ -153,6 +154,7 @@ The seat name must match the Linux user. With `--peercred`, the moderator reject
 | `--log FILE` | Append every received message to FILE as JSON lines |
 | `--wait` | Seconds to keep retrying the connection (default 30) |
 | `--heartbeat` / `--heartbeat-misses` | Same as the moderator's, from the player's side: how often to send, and how many of the moderator's intervals to wait before giving up on it (defaults 2 and 3) |
+| `--bot-think SECONDS` | Bots wait this much longer before every action (default 0) |
 
 ### Trying it without creating users (development mode)
 
@@ -465,6 +467,7 @@ The game's own message types (`ROLE_ASSIGN`, `NIGHT_PROMPT`, `CHAT`, `VOTE_TALLY
 | `deploy_remote.sh` | Installs the code and given seats' certificates on another machine over ssh/scp (see [Playing across machines](#playing-across-machines)) |
 | `run_players.sh` | Starts one machine's seats for a game whose moderator runs elsewhere (installed on player machines by `deploy_remote.sh`) |
 | `test_deploy.sh`, `cluster.sh` | Automated multi-host test: three podman containers act as three machines; deploys over real ssh and plays a game across them |
+| `test_faults.sh` | Automated fault injection on the same containers: `tc netem` latency + loss, and `iptables DROP` partitions mid-night and mid-vote; checks the timeouts fire, players resume, and the game finishes |
 | `test_tls.sh` | Checks who gets a seat over TLS (valid, missing, foreign or stolen certificates; impostor moderators); with sudo, also the key ownership |
 | `tls_server.py`, `tls_probe.py` | Helpers used by `test_tls.sh` |
 | `test_permissions.sh` | Checks that each player can reach only its own socket, and that SO_PEERCRED rejects impostors. Run with sudo after setup. |
@@ -527,6 +530,28 @@ podman exec -it ww-pa bash     #   e.g. ls -l /etc/werewolf/tls; podman rm -f ww
 ```
 
 The first run builds a Fedora image (`localhost/werewolf-host`) with dnf, so it needs network access.
+
+### 0c. Fault injection (needs podman, no sudo, about 4 minutes)
+
+Three whole games on the same three containers, each with one injected fault:
+
+| Game | Fault |
+|---|---|
+| A | `tc netem`: 150 ms ± 50 ms delay and 10 % loss on every host |
+| B | `iptables DROP` between one player host and the moderator from the moment night 1 starts; the seer is on that host |
+| C | the same from the moment voting opens |
+
+For B and C it checks that:
+- the moderator notices within the heartbeat bound;
+- the night or the vote **times out**, with a no-op or abstention for the cut-off seats;
+- the players **resume** once the partition is lifted;
+- the game **finishes**, with every player holding exactly the same broadcasts.
+
+```bash
+./test_faults.sh               # expect: 18 passed, 0 failed
+```
+
+The faults are applied inside the containers' own network namespaces, so your machine's network is untouched. Details and measured timings are in [DISTRIBUTED.md](DISTRIBUTED.md#fault-injection-tests-test_faultssh).
 
 ### 1. Set up users and confirm isolation
 

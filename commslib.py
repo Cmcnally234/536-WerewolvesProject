@@ -974,6 +974,37 @@ class Server:
         """Seats with a working link right now."""
         return [seat for seat, s in self._sessions.items() if s.conn is not None]
 
+    def away(self) -> list[str]:
+        """Seats whose link is down but whose session is still being held."""
+        return [seat for seat, s in self._sessions.items() if s.conn is None]
+
+    def undelivered(self) -> list[str]:
+        """Seats with messages not yet acknowledged (in flight, or waiting for a resume)."""
+        return [seat for seat, s in self._sessions.items() if s.outbox]
+
+    async def wait_for_delivery(self, timeout: float) -> list[str]:
+        """
+        Wait up to `timeout` seconds until every player still in the game has
+        acknowledged everything sent to it (or has left). Returns the seats
+        that still haven't.
+
+        For the end of a game, before close(). Without it, the last messages
+        -- GAME_OVER! -- can be lost two ways:
+          - a player that is reconnecting finds the moderator gone and never
+            gets its replay;
+          - on a slow, lossy link, TCP can still be retransmitting them when
+            close() gives up flushing (CLOSE_TIMEOUT) and aborts the socket,
+            which discards them.
+        A player that gets GAME_OVER leaves at once (BYE ends its session),
+        so on a healthy network this returns within milliseconds.
+        """
+        deadline = time.monotonic() + timeout
+        # Polling is plenty: this runs once per game, and acks arrive within
+        # a heartbeat interval.
+        while (pending := self.undelivered()) and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+        return pending
+
     # --- sending: 1:1, multicast, broadcast -------------------------------
 
     async def send_to(self, player_id: str, msg: dict) -> None:

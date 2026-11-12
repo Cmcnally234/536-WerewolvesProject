@@ -398,6 +398,7 @@ class Game:
             candidates={v: [p for p in self.alive if p != v] for v in voters},
             pending=set(voters),
         )
+        log(f"--- vote {number} --- voters: {sorted(voters)}")
         await self.start_phase("vote", {
             "number": number, "seconds": self.timers.vote, "candidates": list(self.alive),
             "text": f"Voting is open ({self.timers.vote:.0f}s). Most votes is eliminated; a tie spares everyone.",
@@ -561,6 +562,35 @@ async def session(server: Server, args, holder: dict) -> int:
     timers = Timers(args.night_timeout, args.discussion, args.vote_timeout)
     holder["game"] = game = Game(server, args.players, args.seed, timers)
     await game.run(args.max_rounds)
+    holder["over"] = True
+    # Make sure everyone actually has the result before we hang up: over a
+    # lossy link the last messages may still be in flight, and a player may
+    # be mid-reconnect. (Each player leaves with BYE once it has GAME_OVER.)
+    if pending := server.undelivered():
+        started = asyncio.get_running_loop().time()
+        still = await server.wait_for_delivery(args.linger)
+        waited = asyncio.get_running_loop().time() - started
+        # Nobody reads the inbox once the game is over: log the comings and
+        # goings of the wait from it now, so the log says who came back.
+        while True:
+            try:
+                # Not timeout=0: wait_for() then gives up before even looking
+                # at the queue. A short timeout returns at once if it isn't empty.
+                pid, msg = await server.recv_any(timeout=0.05)
+            except TimeoutError:
+                break
+            kind, reason = msg.get("type"), msg.get("reason")
+            if kind == "_resumed":
+                log_resumed(pid, msg)
+            elif kind == "_away" or (kind == "_disconnected" and reason != "left the game"):
+                # (Leaving after GAME_OVER is the normal ending: not news.)
+                log(f"{pid}: {kind[1:]} ({reason})")
+        # Normally everyone acknowledges within milliseconds: only say so
+        # when it took a while, or didn't happen.
+        if still:
+            log(f"after {waited:.1f}s, still no acknowledgement of the result from {still}")
+        elif waited > 1:
+            log(f"everyone has the result (took {waited:.1f}s; was waiting on {pending})")
     return 0
 
 
@@ -582,6 +612,9 @@ async def main() -> int:
     parser.add_argument("--resume-timeout", type=float, default=DEFAULT_RESUME_TIMEOUT,
                         help="seconds to hold a disconnected player's seat for it to "
                              "reconnect; 0 = no reconnecting (default %(default)s)")
+    parser.add_argument("--linger", type=float, default=30.0,
+                        help="after the game, wait up to this long for every player to "
+                             "acknowledge the result (default %(default)s)")
     parser.add_argument("--peercred", action="store_true",
                         help="enforce SO_PEERCRED (player ids must be Linux users)")
     parser.add_argument("--seed", type=int, help="fix the role shuffle")
@@ -639,7 +672,7 @@ async def main() -> int:
     except asyncio.CancelledError:
         log("shutdown requested")
         game = holder.get("game")
-        if game and game.roles:
+        if game and game.roles and not holder.get("over"):
             try:
                 # Tell everyone, but don't let a stuck socket stall shutdown.
                 await asyncio.wait_for(game.game_over(None, "the moderator was shut down"), 3)

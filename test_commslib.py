@@ -941,6 +941,60 @@ async def test_outbox_overflow():
           "session ended")
 
 
+
+async def test_close_waits_for_away():
+    """
+    The game ends while a player is mid-reconnect: wait_for_delivery() lets
+    it come back and acknowledge the last message (GAME_OVER, in the real
+    game) before close() says BYE. Without it, the player finds nobody there.
+    """
+    with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
+        net = Net("tcp", tmp)
+        server = await net.server(resume_timeout=30, **HB)
+        proxy = BlackHoleProxy(net.port)
+        client = await net.client("good", port=await proxy.start(), **HB)
+        await next_event(server, "good", "_connected")
+        proxy.cut()
+        await next_event(server, "good", "_away", timeout=LIMIT + 2)
+        await server.send_to("good", {"type": "FINAL"})     # queued: the player is away
+        start = time.monotonic()
+        still_away = await server.wait_for_delivery(10)
+        waited = time.monotonic() - start
+        await server.close()
+        got = []
+        try:
+            while True:
+                got.append((await client.recv(timeout=3))["type"])
+        except ConnectionClosed as e:
+            ended = str(e)
+        assert still_away == [], still_away
+        assert got[-1] == "FINAL" and "_resumed" in got, got
+        assert server.undelivered() == []
+        assert "ended the session" in ended, ended
+        await client.close()
+        proxy.server.close()
+
+        # And if the player can't come back, the wait is bounded.
+        server = await net.server(resume_timeout=30, **HB)
+        proxy = BlackHoleProxy(net.port)
+        client = await net.client("good", port=await proxy.start(), **HB)
+        await next_event(server, "good", "_connected")
+        proxy.cut()
+        proxy.refuse_new = True
+        await next_event(server, "good", "_away", timeout=LIMIT + 2)
+        await server.send_to("good", {"type": "FINAL"})
+        start = time.monotonic()
+        gave_up = await server.wait_for_delivery(0.5)
+        bounded = time.monotonic() - start
+        assert gave_up == ["good"] and bounded < 1, (gave_up, bounded)
+        await server.close()
+        await client.close()
+        proxy.server.close()
+    print(f"PASS [tcp] game over while a player was away: waited {waited:.2f}s for it to "
+          f"resume and acknowledge, it got {got[-1]} then BYE; unreachable player: gave up "
+          f"after {bounded:.2f}s")
+
+
 async def main():
     for kind in ("unix", "tcp"):
         await test_bad_frames(kind)
@@ -967,6 +1021,7 @@ async def main():
     await test_resume_over_unix()
     await test_lobby_rejoin_vs_locked_roster()
     await test_outbox_overflow()
+    await test_close_waits_for_away()
     print("all commslib tests passed")
 
 

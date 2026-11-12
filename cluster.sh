@@ -95,6 +95,19 @@ cluster_up() {
     done
 }
 
+# cluster_provision N -- a ready-to-play LAN with N seats: setup_users.sh and
+# make_certs.sh on ww-mod, then deploy_remote.sh puts player3+player4 on
+# ww-pa and player5..N on ww-pb. (test_deploy.sh checks each of these steps;
+# this is the quiet version for tests that just need it done.)
+cluster_provision() {
+    local n=${1:-6} rest=() i
+    cx ww-mod bash -c "cd /src && N_PLAYERS=$n ./setup_users.sh >/dev/null &&
+        N_PLAYERS=$n ./make_certs.sh -s DNS:ww-mod -s DNS:localhost -s IP:127.0.0.1 >/dev/null" || return 1
+    cx_admin ww-mod /src/deploy_remote.sh admin@ww-pa player3 player4 >/dev/null 2>&1 || return 1
+    for i in $(seq 5 "$n"); do rest+=("player$i"); done
+    cx_admin ww-mod /src/deploy_remote.sh admin@ww-pb "${rest[@]}" >/dev/null 2>&1
+}
+
 cluster_down() {
     [[ ${KEEP:-0} == 1 && ${1:-} != quiet ]] && { echo "(KEEP=1: cluster left running)"; return; }
     podman rm -f -t 0 "${CLUSTER_HOSTS[@]}" >/dev/null 2>&1

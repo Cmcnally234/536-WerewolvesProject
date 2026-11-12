@@ -40,6 +40,7 @@ Python 3.14, Fedora (SELinux enforcing). Standard library only.
 | `deploy_remote.sh` | `USER@HOST SEAT...`: bundles code + `ca.crt` + only those seats' cert/key (umask 077; `sudo tar` locally if the keys aren't readable), `scp -p` to a remote `mktemp -d`, then `ssh -t sudo bash install.sh` (creates users, `/opt/werewolf` root:werewolf 0750, `/etc/werewolf/tls/<seat>` seat 0700 / key 0600, restorecon, prints commslib checksum). Always removes the remote bundle. `moderator` → user modbot. |
 | `run_players.sh` | Player-host launcher (installed to `/opt/werewolf` by deploy_remote): `--host --port [--tls] [-H/-S names] SEAT... [-- player args]`; bots in background as their users, waits, summary; Ctrl-C → bots leave with BYE. |
 | `cluster.sh`, `test_deploy.sh` | Podman "LAN" (ww-mod, ww-pa, ww-pb on network wwnet, sshd, admin with NOPASSWD sudo, image `localhost/werewolf-host:4`); `cluster_up/down`, `cx`, `cx_admin`. `test_deploy.sh`: 19 checks (deploy, ownership/modes, no stray keys, run_game refusals, a game across 3 hosts). `KEEP=1` keeps containers. Also the base for stage 6. |
+| `test_faults.sh` | Podman cluster, 6 seats (`cluster_provision 6`: p3-4 on ww-pa, p5-6 on ww-pb), seed 19 (player3 = seer), `--heartbeat 1`, remote bots `--bot-think 2`. A: netem 150±50ms + 10% loss on all hosts. B: iptables DROP ww-pa↔mod at `--- night 1 ---` → away within 3s, night times out with no-op for player3, heal, resume, Time's up replayed. C: same at `--- vote 1 ---` on the host with voters → vote timeout/abstain, resume. All: game finishes, same broadcasts for all 6. 18 checks. |
 | `ARCHITECTURE.md` | Writeup material: topology diagram, commslib/framing, permissions, message table, concurrency, rules, tests, limitations. |
 
 `setup_users.sh` is the deploy step for this machine; `deploy_remote.sh` deploys to other machines over ssh.
@@ -98,6 +99,7 @@ Exit status = the moderator's (0 finished, 1 aborted or nobody joined). Logs go 
   - `--max-rounds` (20; a draw after that many rounds)
   - `--heartbeat` (2) / `--heartbeat-misses` (3)
   - `--resume-timeout` (120; 0 = no reconnecting)
+  - `--linger` (30; after the game, wait for every player to acknowledge the result)
   - `--local`
 - **player.py**:
   - `--dir`
@@ -105,6 +107,7 @@ Exit status = the moderator's (0 finished, 1 aborted or nobody joined). Logs go 
   - `--bot [act|silent]` (no keyboard)
   - `--log FILE` (append every received message as JSON lines; used by the tests)
   - `--wait` (connect retry seconds, 30)
+  - `--bot-think SECONDS` (extra delay before each bot action; used by test_faults.sh)
   - `--heartbeat` (2) / `--heartbeat-misses` (3)
 
 In-game commands: `/kill`, `/peek` or `/heal <name|number>`; `/w <msg>` (wolf whisper, night only); `/vote <name|number|none>`; `/role`; `/help`; `/quit`. Any line without a leading `/` is day chat.
@@ -122,6 +125,7 @@ python3 ping_server.py & for p in p1 p2 p3; do python3 ping_client.py $p & done;
 sudo ./test_permissions.sh      # real users only
 ./test_tls.sh                   # 14 checks; sudo ./test_tls.sh adds key ownership (21)
 ./test_deploy.sh                # podman, no sudo: 19 checks, deploy + a game across 3 container "hosts"
+./test_faults.sh                # podman, no sudo: 18 checks, netem latency/loss + iptables partitions mid-night / mid-vote
 ```
 
 Across machines: `sudo ./make_certs.sh -s IP:<mod addr> ...`, `./deploy_remote.sh user@host player3 player4`, `sudo ./run_game.sh --host <mod addr> --port 5555 -R 3,4 [--open-firewall]`, then on the player host `sudo /opt/werewolf/run_players.sh --host <mod addr> --port 5555 player3 player4`.
@@ -145,6 +149,8 @@ TCP + TLS by hand: `./make_certs.sh -o /tmp/pki p1 p2 p3 p4 p5`, then add `--por
 - **`$?` after `$(...)` in the same command is the substitution's status.** run_game.sh's summary printed every bot as exit 0 for that reason (fixed: save `code=$?` right after `wait`).
 - **`umask 077` + `mkdir -p` makes missing parents 0700 too.** make_certs.sh creates `$OUT` under `umask 022` so `/etc/werewolf` stays traversable (found by test_deploy.sh; test_tls.sh's temp dirs hid it).
 - **Cluster containers:** sshd there needs `PerSourcePenalties no`, an unlocked account (`usermod -p '*'`), `pam_loginuid` optional, and `podman exec -u` needs `-e HOME=...`. `firewalld` isn't in the containers, so `--open-firewall` is untested there.
+- **`asyncio.wait_for(q.get(), 0)` raises TimeoutError even if the queue has an item** (Python 3.14). Use a small positive timeout to drain.
+- **test_faults/test_deploy copy the working tree's `*.py`/`*.sh` into the containers at start** — don't edit them while those tests run.
 - In this dev shell, `ls` is aliased to a different tool. Use `/usr/bin/ls` when exit codes or exact output matter.
 
 ## Messages
@@ -178,6 +184,7 @@ TCP + TLS by hand: `./make_certs.sh -o /tmp/pki p1 p2 p3 p4 p5`, then add `--por
 - **Seat = certificate CN (TCP).** The moderator runs `start_tls()` itself in `_handshake_tcp` (so failures become `_rejected`), takes the seat from the verified peer cert, and only *checks* the HELLO's `player` against it. Both sides trust only `ca.crt`; TLS 1.3 minimum; the player verifies the moderator's SAN against `--host`. No plaintext TCP mode.
 - **Sessions** (`_Session`, both ends, both transports): every game message is `DATA {seq, ack, msg}`; acks piggyback on every frame (DATA and HEARTBEAT); the outbox keeps unacked messages; receiver delivers only `in_seq+1`, drops `≤ in_seq`, gap = ProtocolError. Every connection does HELLO{player, token, ack} → WELCOME{token, ack, resumed, replaying, resume_timeout} → replay. `Connection.write()` is synchronous (numbering + write in one step = wire order is seq order; no send lock). Server `_hello` is await-free from session lookup to `attach()` (race-free). Link loss → `_away` + expiry timer; token resume → `_resumed` (takeover if the old link still looked alive); `BYE`/ProtocolError/expiry → `_disconnected`. Client reconnects itself (backoff 0.2→2s) for the server's resume_timeout. `Server.connected()` = sessions (live or away); `live()` = live links. `lock_roster()` after the lobby.
 - **Game while away:** no pause; away player stays alive and pending; messages queue and replay; silence at a deadline = no-op/abstain as before.
+- **End of game:** `session()` calls `server.wait_for_delivery(--linger)` (outboxes empty = everyone acked or left with BYE) before `close()`, then logs the `_resumed`/`_away` events of the wait (normal BYE leaves aren't logged). Found by test_faults.sh: an away player, or a lossy link still retransmitting when `close()`'s 2s flush limit aborted the socket, lost GAME_OVER. Signals skip the wait (`holder["over"]` also stops a second GAME_OVER).
 - **Heartbeats** (`Connection.heartbeat`, one task per link on both sides, both transports): `HEARTBEAT {interval}` sent at once then every interval; `recv()` swallows them and stamps `last_heard` on every frame; silence ≥ misses × *peer's announced* interval → `abort(reason)` → the normal reader/`_disconnected` path. Interval belongs to the sender, misses to the detector. `abort(reason)` makes the reader report that reason instead of "peer closed".
 - **Lobby** (`moderator.lobby()`) reads the inbox itself rather than `wait_for_players`, so joins and rejections are logged as they happen; it tracks joins from events, not `server.connected()` (which runs ahead of the inbox).
 - **`Game.message_loop(seconds, handle, is_done)`** is the one concurrency loop. It gives each phase a single overall deadline; each `recv_any` waits only for the time remaining. Night and vote end early when nobody is pending; discussion always runs its full time.

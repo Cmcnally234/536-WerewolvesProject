@@ -137,7 +137,7 @@ So an impostor moderator can't collect votes or whispers. `test_tls.sh` checks a
 
 These are kernel-level and coarse. The application heartbeats below catch the cases they can't.
 
-## Failure model (so far)
+## Failure model
 
 **What TLS buys us:** confidentiality (nobody on the network can read roles or wolf whispers), integrity (nobody can alter a vote in flight), and authentication of *both* ends. What it doesn't cover: a player who leaks their own key, and a compromised moderator host (it holds every role and the CA key).
 
@@ -160,6 +160,7 @@ A **link** failure and a **session** ending are now different things. A broken l
 | Bad, missing, or foreign certificate; certificate for another seat | TLS handshake / seat check | Refused, `_rejected` with the reason (table above) |
 | Impostor moderator | the player's certificate and hostname check | `ssl.SSLCertVerificationError`; the player never sends a byte of game data |
 | Moderator's own key missing or unreadable | `Server.start()` | `OSError` at startup; `moderator.py` prints it and exits 2 |
+| Game ends while a player is away, or while the last messages are still crossing a lossy link | `Server.wait_for_delivery()` before `close()` | The moderator waits (up to `--linger`, 30 s) until every player has acknowledged everything or left; see [The end of a game](#the-end-of-a-game) |
 | Moderator shuts down | `Server.close()` | `BYE` to every live player (so they don't try to reconnect), pending sends flushed (2 s limit), then TLS close_notify and FIN; handshakes in progress are cancelled |
 | Moderator crashes (no `BYE`) | each player's heartbeat or EOF | Players redial for `resume_timeout`, then give up: `could not reconnect within ...` |
 
@@ -276,3 +277,32 @@ An `ack` that isn't a non-negative integer, or that is larger than anything we s
   - `* Reconnected after 14.2s. Catching up on 7 missed message(s):`
 
 `--resume-timeout 0` turns all of this off: a broken link ends the session at once, as in Project 1.
+
+## The end of a game
+
+Sending `GAME_OVER` and hanging up straight away is not enough on a real network. Two things went wrong in fault-injection testing:
+
+- **A player was away when the game ended.** Scenario C below ended on the very vote that timed out because of the partition. The players came back to a moderator that had already gone, so their replay, `GAME_OVER` included, never arrived.
+- **A lossy link was still delivering the last messages.** Scenario A had 10 % loss and a round trip of about 450 ms. `GAME_OVER` and `BYE` were still being retransmitted when `close()` stopped waiting for the flush (`CLOSE_TIMEOUT`, 2 s) and aborted the socket, which discards anything unsent. The player saw a reset instead of the result.
+
+So the moderator now calls `Server.wait_for_delivery(linger)` before `close()`. It waits until every session's outbox is empty, i.e. until each player has acknowledged everything. A player that receives `GAME_OVER` leaves at once with `BYE`, which also ends its session. On a healthy network this wait takes milliseconds and isn't logged. On a bad one it lasts as long as it takes, up to `--linger` (30 s), and the moderator logs who it waited for and who came back.
+
+A signal (Ctrl-C, SIGTERM) skips the wait: the operator asked to stop.
+
+## Fault-injection tests (`test_faults.sh`)
+
+These tests run on the podman "LAN" from `cluster.sh`: three containers, each with its own network namespace. The moderator, player1 and player2 are on `ww-mod`; player3 and player4 on `ww-pa`; player5 and player6 on `ww-pb`. Faults are injected for real, inside the containers, and no host root is needed. A rootless container's `NET_ADMIN` applies to its own network namespace, and the kernel loads `sch_netem` on first use.
+
+| Scenario | Fault | What must hold (and did) |
+|---|---|---|
+| **A. Latency + loss** | `tc qdisc replace dev eth0 root netem delay 150ms 50ms loss 10%` on all three hosts, so both directions of every cross-host link are affected | The measured round trip is ≥ 200 ms (seen: 450–1600 ms, since the loss adds retransmission time). The game finishes, every process exits 0, no session ends, and all six players hold the same broadcasts. |
+| **B. Partition mid-night** | `iptables -I INPUT -s <moderator> -j DROP` and `-I OUTPUT -d <moderator> -j DROP` on `ww-pa` the moment night 1 starts. With seed 19, player3 on `ww-pa` is the seer, so the night can't end without it. | The moderator marks player3/4 away within the heartbeat bound (seen: ~2.7 s against 3 s), saying `no heartbeat`. **Night 1 times out** after 8 s with `no-op for ['player3']`. After `iptables -D`, both resume within ~1 s, with 6–7 messages replayed, including player3's `Time's up` notice sent while it was cut off. The game finishes and the broadcasts are identical. |
+| **C. Partition mid-vote** | The same rules, on whichever remote host has voters, the moment voting opens | Noticed within the bound. **The vote times out** after 6 s, with the cut-off seats counted as abstaining. They resume after healing (during the game, or during the end-of-game wait), the game finishes, and the broadcasts are identical. |
+
+Why `iptables DROP` rather than stopping a process or closing a socket: `DROP` discards packets silently, with no RST and no ICMP. Neither TCP stack learns anything is wrong. The established connection just goes quiet, exactly like a cable pulled somewhere in between. Only the application heartbeat notices, and the client's reconnect attempts (SYNs) are dropped too until the rules are removed.
+
+**Making the timing deterministic:**
+- Remote bots run with `--bot-think 2`: they answer 2 s after a prompt, so a partition made when the phase starts (detected from the moderator's log within ~0.3 s) is in place before they act.
+- Everyone uses a 1 s heartbeat interval, giving a 3 s bound.
+- The moderator logs `--- vote N --- voters: [...]` when voting opens, so the test knows which host to cut.
+
