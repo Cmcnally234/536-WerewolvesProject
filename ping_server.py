@@ -4,38 +4,32 @@ ping_server.py -- stand-in "moderator" for testing commslib.py alone.
 Exercises: 1:1 (send_to), multicast, broadcast, recv_any with a timeout,
 and a large message that is guaranteed to be split across socket reads.
 
-Usage:
-  local dev:   python3 ping_server.py [--dir /tmp/werewolf-test] [p1 p2 p3]
-  real users:  sudo -u modbot python3 /opt/werewolf/ping_server.py \
-                   --dir /run/werewolf --peercred player1 player2 player3
+Over TCP + mutual TLS, like the game, so it needs certificates:
+  local dev:   ./make_certs.sh -o /tmp/pki p1 p2 p3
+               python3 ping_server.py --tls /tmp/pki [p1 p2 p3]
+  real users:  sudo -u modbot python3 /opt/werewolf/ping_server.py player1 player2 player3
 """
 
 import argparse
 import asyncio
-import os
 
-from commslib import Server
+from commslib import DEFAULT_PORT, DEFAULT_TLS_DIR, Server
 
 PONG_TIMEOUT = 2.0  # seconds to wait for pongs before giving up on laggards
 
 
 async def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dir", default="/tmp/werewolf-test")
-    parser.add_argument("--peercred", action="store_true",
-                        help="enforce SO_PEERCRED (player ids must be Linux users)")
+    parser.add_argument("--tls", default=DEFAULT_TLS_DIR)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("players", nargs="*", default=["p1", "p2", "p3"])
     args = parser.parse_args()
     players = args.players
 
-    # For local dev without setup_users.sh, make the per-seat directories.
-    # Under /run/werewolf they already exist and this changes nothing.
-    for pid in players:
-        os.makedirs(os.path.join(args.dir, pid), exist_ok=True)
-
     server = Server()
-    await server.start(players, base_dir=args.dir, check_peer_uid=args.peercred)
-    print(f"[server] listening on {args.dir}/<id>/sock for {players}")
+    await server.start(players, host=args.host, port=args.port, tls_dir=args.tls)
+    print(f"[server] listening on TCP+TLS {args.host}:{server.port} for {players}")
 
     await server.wait_for_players(timeout=15)
     print(f"[server] all connected: {server.connected()}")

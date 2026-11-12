@@ -7,9 +7,11 @@ Two things happen at the same time, as two asyncio tasks:
 Neither waits for the other, so a message from the moderator shows up even
 while you're halfway through typing.
 
-    local dev:   python3 player.py p1 --dir /tmp/werewolf-test
-    over TLS:    python3 player.py p1 --port 5555 --tls DIR [--host moderator.example]
+It connects to the moderator over TCP + mutual TLS (see commslib.py):
+
+    local dev:   python3 player.py p1 --tls /tmp/pki            (./make_certs.sh -o /tmp/pki ...)
     real users:  sudo -u player1 python3 /opt/werewolf/player.py player1
+    other hosts: ... --host <the moderator's address, as in its certificate>
 """
 
 import argparse
@@ -23,8 +25,8 @@ import sys
 import termios
 import tty
 
-from commslib import (DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_HEARTBEAT_MISSES,
-                      DEFAULT_TLS_DIR, Client, ConnectionClosed, player_socket_path)
+from commslib import (DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_HEARTBEAT_MISSES, DEFAULT_PORT,
+                      DEFAULT_TLS_DIR, Client, ConnectionClosed)
 
 
 # ---------------------------------------------------------------------------
@@ -430,10 +432,10 @@ async def keyboard_loop(client: Client, term: Terminal, state: PlayerState):
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("name", help="your seat / player id, e.g. player1")
-    parser.add_argument("--dir", default="/run/werewolf")
-    parser.add_argument("--port", type=int, help="connect over TCP instead of a UNIX socket")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT,
+                        help="the moderator's TCP port (default %(default)s)")
     parser.add_argument("--host", default="127.0.0.1",
-                        help="moderator's TCP address; must be a name or IP in its certificate")
+                        help="the moderator's address; must be a name or IP in its certificate")
     parser.add_argument("--tls", default=DEFAULT_TLS_DIR,
                         help=f"TLS files from make_certs.sh (default {DEFAULT_TLS_DIR})")
     parser.add_argument("--heartbeat", type=float, default=DEFAULT_HEARTBEAT_INTERVAL,
@@ -457,11 +459,13 @@ async def main() -> int:
         print(e, file=sys.stderr)
         return 2
     try:
-        await client.connect(player_socket_path(args.name, args.dir), retry_seconds=args.wait,
-                             host=args.host, port=args.port, player_id=args.name,
-                             tls_dir=args.tls)
+        await client.connect(player_id=args.name, host=args.host, port=args.port,
+                             tls_dir=args.tls, retry_seconds=args.wait)
     except OSError as e:
-        print(f"could not connect: {e}", file=sys.stderr)
+        # A connect timeout has an empty message; say what it usually means.
+        reason = str(e) or (f"no answer from {args.host}:{args.port} within the connect timeout "
+                            "(wrong address, or a firewall silently dropping the port)")
+        print(f"could not connect: {reason}", file=sys.stderr)
         return 1
 
     state = PlayerState(args.name)

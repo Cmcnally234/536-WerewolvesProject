@@ -1,10 +1,9 @@
 """
 ping_client.py -- stand-in "player" for testing commslib.py alone.
 
-Usage:
-  local dev:   python3 ping_client.py p1 [--delay 3] [--dir /tmp/werewolf-test]
-  real users:  sudo -u player1 python3 /opt/werewolf/ping_client.py player1 \
-                   --dir /run/werewolf
+Usage (certificates as for ping_server.py):
+  local dev:   python3 ping_client.py p1 --tls /tmp/pki [--delay 3]
+  real users:  sudo -u player1 python3 /opt/werewolf/ping_client.py player1
 
 --delay simulates a slow player so you can see the server's timeout.
 """
@@ -12,21 +11,22 @@ Usage:
 import argparse
 import asyncio
 
-from commslib import Client, ConnectionClosed, player_socket_path
+from commslib import DEFAULT_PORT, DEFAULT_TLS_DIR, Client, ConnectionClosed
 
 
 async def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("name")
     parser.add_argument("--delay", type=float, default=0.0)
-    parser.add_argument("--dir", default="/tmp/werewolf-test")
+    parser.add_argument("--tls", default=DEFAULT_TLS_DIR)
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     args = parser.parse_args()
     name, delay = args.name, args.delay
-    socket_path = player_socket_path(name, args.dir)
 
     client = Client()
-    await client.connect(socket_path)
-    print(f"[{name}] connected to {socket_path}")
+    await client.connect(player_id=name, host=args.host, port=args.port, tls_dir=args.tls)
+    print(f"[{name}] connected to {args.host}:{args.port} (TLS)")
 
     try:
         while True:

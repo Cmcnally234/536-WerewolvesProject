@@ -5,16 +5,17 @@
 #   sudo ./run_game.sh                        # 5 seats, all bots
 #   sudo ./run_game.sh -H 1,2                 # player1 + player2 are humans, the rest bots
 #   sudo ./run_game.sh -n 6 -S 4 -- --night-timeout 15 --discussion 20
-#   sudo ./run_game.sh --port 5555                       # TCP + TLS, all on this machine
-#   sudo ./run_game.sh --host 192.168.1.10 --port 5555 -R 3,4,5 --open-firewall
+#   sudo ./run_game.sh --host 192.168.1.10 -R 3,4,5 --open-firewall   # seats 3-5 elsewhere
+#
+# Every player talks to the moderator over TCP + mutual TLS, with the
+# certificates from make_certs.sh -- on this machine as much as on others.
 #
 # Options:
 #   -n N      number of seats, 4-6 (default 5; setup_users.sh must have created them)
 #   -H LIST   comma-separated seat numbers played by humans (default: none)
 #   -S LIST   seat numbers run as SILENT bots -- they never respond, which
 #             shows the moderator's timeout path
-#   --port N  play over TCP + mutual TLS on port N instead of UNIX sockets
-#             (certificates from make_certs.sh)
+#   --port N  the moderator's TCP port (default 5555)
 #   --host A  the moderator's address (default 127.0.0.1): it listens there,
 #             local seats connect there, and remote players must use it. It
 #             must be a name or IP in the moderator's certificate.
@@ -33,10 +34,9 @@
 set -uo pipefail
 
 APP_DIR=/opt/werewolf
-RUN_DIR=/run/werewolf
 SRC_DIR=$(dirname "$(readlink -f "$0")")
 
-usage() { sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'; }
 die() { echo "error: $*" >&2; exit 1; }
 
 # --- arguments ----------------------------------------------------------------
@@ -46,7 +46,7 @@ HUMANS=""
 SILENT=""
 REMOTE=""
 HOST=127.0.0.1
-PORT=""
+PORT=5555
 TLS=/etc/werewolf/tls
 OPEN_FW=0
 # A plain loop rather than getopts, which can't parse long options.
@@ -83,14 +83,9 @@ done
 for s in $REMOTE; do
     [[ " $HUMANS $SILENT " == *" $s "* ]] && die "seat $s is remote: it can't also be -H or -S here"
 done
-if [[ -n $PORT ]]; then
-    [[ $PORT =~ ^[0-9]+$ ]] || die "--port must be a number"
-    if [[ -n $REMOTE && ($HOST == 127.* || $HOST == localhost) ]]; then
-        die "remote seats can't reach $HOST -- give --host this machine's address (one in the moderator's certificate)"
-    fi
-else
-    [[ -z $REMOTE && $OPEN_FW -eq 0 && $HOST == 127.0.0.1 ]] ||
-        die "-R, --host and --open-firewall need --port (UNIX sockets don't leave this machine)"
+[[ $PORT =~ ^[0-9]+$ ]] || die "--port must be a number"
+if [[ -n $REMOTE && ($HOST == 127.* || $HOST == localhost) ]]; then
+    die "remote seats can't reach $HOST -- give --host this machine's address (one in the moderator's certificate)"
 fi
 
 # --- is the machine ready? -----------------------------------------------------
@@ -104,24 +99,18 @@ kind_of() {    # kind_of <seat number> -> human | silent | remote | bot
 }
 
 id -u modbot >/dev/null 2>&1 || die "no modbot user -- run: sudo ./setup_users.sh"
-if [[ -z $PORT ]]; then
-    for i in $(seq 1 "$N"); do
-        [[ -d $RUN_DIR/player$i ]] || die "$RUN_DIR/player$i missing (/run is wiped on reboot) -- run: sudo N_PLAYERS=$N ./setup_users.sh"
-    done
-else
-    [[ -f $TLS/moderator/key.pem ]] || die "no moderator certificate in $TLS -- run: sudo ./make_certs.sh"
-    # Catch the most common cross-machine mistake here rather than as a
-    # certificate error on every player: the address players will dial
-    # must be in the moderator's certificate.
-    if [[ $HOST =~ ^[0-9.]+$ ]]; then check=(-checkip "$HOST"); else check=(-checkhost "$HOST"); fi
-    if ! openssl x509 -in "$TLS/moderator/cert.pem" -noout "${check[@]}" | grep -q "does match"; then
-        die "the moderator's certificate doesn't list '$HOST' -- reissue it: sudo ./make_certs.sh -s IP:<addr> -s DNS:<name> ..."
-    fi
-    for i in $(seq 1 "$N"); do
-        [[ $(kind_of "$i") == remote ]] && continue
-        [[ -f $TLS/player$i/key.pem ]] || die "no certificate for player$i in $TLS -- run: sudo N_PLAYERS=$N ./make_certs.sh"
-    done
+[[ -f $TLS/moderator/key.pem ]] || die "no moderator certificate in $TLS -- run: sudo ./make_certs.sh"
+# Catch the most common cross-machine mistake here rather than as a
+# certificate error on every player: the address players will dial must be
+# in the moderator's certificate.
+if [[ $HOST =~ ^[0-9.]+$ ]]; then check=(-checkip "$HOST"); else check=(-checkhost "$HOST"); fi
+if ! openssl x509 -in "$TLS/moderator/cert.pem" -noout "${check[@]}" | grep -q "does match"; then
+    die "the moderator's certificate doesn't list '$HOST' -- reissue it: sudo ./make_certs.sh -s IP:<addr> -s DNS:<name> ..."
 fi
+for i in $(seq 1 "$N"); do
+    [[ $(kind_of "$i") == remote ]] && continue
+    [[ -f $TLS/player$i/key.pem ]] || die "no certificate for player$i in $TLS -- run: sudo N_PLAYERS=$N ./make_certs.sh"
+done
 
 # Players run the copy in /opt/werewolf, not this directory. Refuse to start
 # a game on stale code -- the classic "I fixed it but nothing changed" trap.
@@ -139,18 +128,10 @@ chmod 0755 "$LOG_DIR"
 SEATS=()
 for i in $(seq 1 "$N"); do SEATS+=("player$i"); done
 
-# How players reach the moderator, and how the moderator listens.
-if [[ -n $PORT ]]; then
-    NET=(--host "$HOST" --port "$PORT" --tls "$TLS")
-    MOD_NET=("${NET[@]}")
-    WHERE="TCP+TLS $HOST:$PORT"
-else
-    NET=()
-    MOD_NET=(--peercred)      # SO_PEERCRED: UNIX sockets only
-    WHERE="UNIX sockets in $RUN_DIR"
-fi
+# Where the moderator listens = where every player connects.
+NET=(--host "$HOST" --port "$PORT" --tls "$TLS")
 
-echo "== werewolf: $N seats over $WHERE, logs in $LOG_DIR =="
+echo "== werewolf: $N seats over TCP+TLS $HOST:$PORT, logs in $LOG_DIR =="
 for i in $(seq 1 "$N"); do
     case $(kind_of "$i") in
         human)  echo "  player$i  HUMAN   open a terminal and run:  sudo -u player$i python3 $APP_DIR/player.py player$i ${NET[*]}" ;;
@@ -222,7 +203,7 @@ done
 
 # tee -i: tee ignores Ctrl-C, so it keeps copying the moderator's shutdown
 # messages instead of dying and breaking the pipe under it.
-sudo -u modbot python3 "$APP_DIR/moderator.py" "${MOD_NET[@]}" "${MOD_ARGS[@]}" "${SEATS[@]}" 2>&1 \
+sudo -u modbot python3 "$APP_DIR/moderator.py" "${NET[@]}" "${MOD_ARGS[@]}" "${SEATS[@]}" 2>&1 \
     | tee -i "$LOG_DIR/moderator.out"
 MOD_STATUS=${PIPESTATUS[0]}
 
@@ -250,13 +231,11 @@ for i in $(seq 1 "$N"); do
         echo "  player$i ($(kind_of "$i")): exit status $code"
     fi
 done
-if [[ -z $PORT ]]; then
-    leftover=$(find "$RUN_DIR" -type s 2>/dev/null)
-    if [[ -z $leftover ]]; then
-        echo "  socket files left behind: none"
-    else
-        echo "  socket files left behind: $leftover"
-    fi
+# The TCP analogue of "no socket files left behind": nothing still listens.
+if ss -Hltn "sport = :$PORT" 2>/dev/null | grep -q .; then
+    echo "  port $PORT: something is still listening on it"
+else
+    echo "  port $PORT: released"
 fi
 
 # Hand the logs to whoever ran sudo, so they can read them without root.

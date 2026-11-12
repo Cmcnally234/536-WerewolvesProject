@@ -8,7 +8,7 @@
 #
 # Options:
 #   --host ADDR   the moderator's address -- a name or IP its certificate lists
-#   --port N      the moderator's port
+#   --port N      the moderator's port (default 5555)
 #   --tls DIR     certificates (default /etc/werewolf/tls)
 #   -H LIST       comma-separated seats played by humans: their commands are
 #                 printed, and you start each in its own terminal
@@ -24,7 +24,7 @@ set -uo pipefail
 APP_DIR=/opt/werewolf
 TLS=/etc/werewolf/tls
 HOST=""
-PORT=""
+PORT=5555
 HUMANS=""
 SILENT=""
 
@@ -55,7 +55,7 @@ while [[ $# -gt 0 && $1 != -- ]]; do SEATS+=("$1"); shift; done
 BOT_ARGS=("$@")
 
 [[ $EUID -eq 0 ]] || die "run with sudo"
-[[ -n $HOST && -n $PORT ]] || die "--host and --port are required"
+[[ -n $HOST ]] || die "--host (the moderator's address) is required"
 [[ $PORT =~ ^[0-9]+$ ]] || die "--port must be a number"
 ((${#SEATS[@]} > 0)) || die "name at least one seat"
 for s in $HUMANS $SILENT; do

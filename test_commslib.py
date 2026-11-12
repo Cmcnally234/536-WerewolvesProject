@@ -4,11 +4,11 @@ heartbeats, and sessions (sequence numbers, acks, resume).
 
     python3 test_commslib.py
 
-In-process, no sudo. Each test runs a real Server, over UNIX sockets in a
-temp dir or over TCP + TLS on a free localhost port (certificates from a
-throwaway PKI made by make_certs.sh); the failure-path tests run on both. Misbehaving peers are played by raw asyncio connections (this
-test, like perm_probe.py, is allowed to touch sockets directly: the point
-is to send bytes a well-behaved Client never would).
+In-process, no sudo. Each test runs a real Server over TCP + mutual TLS on
+a free localhost port, with certificates from a throwaway PKI made by
+make_certs.sh. Misbehaving peers are played by raw asyncio TLS connections
+(this test, like tls_probe.py, is allowed to touch sockets directly: the
+point is to send bytes a well-behaved Client never would).
 """
 
 import asyncio
@@ -21,8 +21,7 @@ import tempfile
 import time
 
 import commslib
-from commslib import (Client, ConnectionClosed, SeatRefused, Server,
-                      player_socket_path, tls_paths)
+from commslib import Client, ConnectionClosed, SeatRefused, Server, tls_paths
 from testnet import shared_pki
 
 SEATS = ["good", "bad"]
@@ -49,45 +48,41 @@ async def tls_open(port: int, cert_of: str):
 
 
 class Net:
-    """One transport for one test: UNIX in a temp dir, or TCP on a free port."""
+    """One moderator for one test: TCP + TLS on a free localhost port."""
 
-    def __init__(self, kind: str, tmp: str):
-        self.kind, self.tmp = kind, tmp
+    def __init__(self, tmp: str):
+        self.tmp = tmp
 
     async def server(self, send_timeout: float = 1.0, seats=SEATS, resume_timeout=0,
                      **heartbeat) -> Server:
         # resume_timeout=0 unless a test says otherwise: the stage 0-3 tests
         # are about noticing that a link is dead, which then ends the session.
         server = Server(send_timeout=send_timeout, resume_timeout=resume_timeout, **heartbeat)
-        if self.kind == "tcp":
-            await server.start(seats, port=0, tls_dir=PKI)   # 0 = let the kernel pick
-            self.port = server.port
-        else:
-            for seat in seats:
-                os.makedirs(os.path.join(self.tmp, seat), exist_ok=True)
-            await server.start(seats, base_dir=self.tmp)
+        await server.start(seats, port=0, tls_dir=PKI)   # 0 = let the kernel pick
+        self.port = server.port
         return server
 
     async def client(self, seat: str, retry_seconds: float = 2.0, port=None,
                      **heartbeat) -> Client:
         client = Client(**heartbeat)
-        if self.kind == "tcp":
-            await client.connect(port=port or self.port, player_id=seat, tls_dir=PKI,
-                                 retry_seconds=retry_seconds)
-        else:
-            await client.connect(player_socket_path(seat, self.tmp), retry_seconds=retry_seconds)
+        await client.connect(port=port or self.port, player_id=seat, tls_dir=PKI,
+                             retry_seconds=retry_seconds)
         return client
 
     async def raw(self, seat: str):
-        """A raw connection already sitting in `seat` (TLS for TCP, then HELLO)."""
-        if self.kind == "unix":
-            r, w = await asyncio.open_unix_connection(player_socket_path(seat, self.tmp))
-        else:
-            r, w = await tls_open(self.port, seat)
+        """A raw TLS connection already sitting in `seat` (HELLO done)."""
+        r, w = await tls_open(self.port, seat)
         w.write(frame(json.dumps({"type": "HELLO", "player": seat, "token": None,
                                   "ack": 0}).encode()))
         assert (await read_frame(r))["type"] == "WELCOME"
         return r, w
+
+
+async def fake_moderator(handler):
+    """A hand-built TLS 'moderator' (real moderator certificate) running `handler`."""
+    tls = commslib._tls_context(commslib.MODERATOR_ID, PKI, server_side=True)
+    srv = await asyncio.start_server(handler, "127.0.0.1", 0, ssl=tls)
+    return srv, srv.sockets[0].getsockname()[1]
 
 
 async def next_event(server: Server, pid, kind: str, timeout: float = 3.0) -> dict:
@@ -103,10 +98,10 @@ async def next_event(server: Server, pid, kind: str, timeout: float = 3.0) -> di
 # Stage 0: failure paths (both transports)
 # ---------------------------------------------------------------------------
 
-async def bad_frame_case(kind: str, name: str, raw: bytes, expect_in_reason: str) -> None:
+async def bad_frame_case(name: str, raw: bytes, expect_in_reason: str) -> None:
     """A peer sends `raw`: it must be dropped, and a good player must not notice."""
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        net = Net(kind, tmp)
+        net = Net(tmp)
         server = await net.server()
         good = await net.client("good")
         _, w = await net.raw("bad")
@@ -126,18 +121,18 @@ async def bad_frame_case(kind: str, name: str, raw: bytes, expect_in_reason: str
         w.close()
         await good.close()
         await server.close()
-    print(f"PASS [{kind}] {name}: bad peer dropped ({ev['reason']!r}); good player unaffected")
+    print(f"PASS {name}: bad peer dropped ({ev['reason']!r}); good player unaffected")
 
 
-async def test_bad_frames(kind: str):
-    await bad_frame_case(kind, "malformed JSON", frame(b"{not json"), "malformed")
-    await bad_frame_case(kind, "invalid UTF-8", frame(b"\xff\xfe"), "malformed")
-    await bad_frame_case(kind, "non-dict JSON", frame(json.dumps([1, 2]).encode()),
+async def test_bad_frames():
+    await bad_frame_case("malformed JSON", frame(b"{not json"), "malformed")
+    await bad_frame_case("invalid UTF-8", frame(b"\xff\xfe"), "malformed")
+    await bad_frame_case("non-dict JSON", frame(json.dumps([1, 2]).encode()),
                          "list, not an object")
-    await bad_frame_case(kind, "oversized header",
+    await bad_frame_case("oversized header",
                          struct.pack(">I", commslib.MAX_MESSAGE_BYTES + 1), "oversized")
     for interval in (0, -1, True, "2", commslib.MAX_HEARTBEAT_INTERVAL + 1):
-        await bad_frame_case(kind, f"heartbeat interval {interval!r}",
+        await bad_frame_case(f"heartbeat interval {interval!r}",
                              frame(json.dumps({"type": "HEARTBEAT", "interval": interval}).encode()),
                              "bad heartbeat interval")
 
@@ -154,17 +149,15 @@ async def fake_welcome(reader, writer) -> None:
 async def test_client_sentinel_on_garbage():
     """A moderator that sends garbage must wake the player's recv(), not hang it."""
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        path = os.path.join(tmp, "sock")
-
         async def evil(reader, writer):
             await fake_welcome(reader, writer)
             writer.write(frame(b"[]"))
             await writer.drain()
             await asyncio.sleep(5)  # stay connected: EOF must not be what saves us
 
-        srv = await asyncio.start_unix_server(evil, path=path)
+        srv, port = await fake_moderator(evil)
         client = Client()
-        await client.connect(path)
+        await client.connect(player_id="good", port=port, tls_dir=PKI)
         try:
             await client.recv(timeout=2)
             raise AssertionError("recv() returned a non-dict frame")
@@ -183,7 +176,7 @@ async def test_client_sentinel_on_garbage():
 async def test_client_sentinel_on_unexpected_error():
     """Even a non-ConnectionClosed error in the read loop must end recv()."""
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        net = Net("unix", tmp)
+        net = Net(tmp)
         server = await net.server()
         client = await net.client("good")
 
@@ -204,11 +197,11 @@ async def test_client_sentinel_on_unexpected_error():
         await server.close()
 
 
-async def test_send_timeout(kind: str):
+async def test_send_timeout():
     """A player that stops reading is dropped after send_timeout; others keep working."""
     send_timeout = 1.0
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        net = Net(kind, tmp)
+        net = Net(tmp)
         server = await net.server(send_timeout=send_timeout)
         good = await net.client("good")
         # The stuck player connects and then never reads a byte.
@@ -238,14 +231,14 @@ async def test_send_timeout(kind: str):
         w.close()
         await good.close()
         await server.close()
-    print(f"PASS [{kind}] stuck reader dropped ({ev['reason']!r}) after {elapsed:.1f}s "
+    print(f"PASS stuck reader dropped ({ev['reason']!r}) after {elapsed:.1f}s "
           "of broadcasting; good player unaffected")
 
 
-async def test_close_with_stuck_peer(kind: str):
+async def test_close_with_stuck_peer():
     """Server.close() must finish even if a peer never reads its pending data."""
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        net = Net(kind, tmp)
+        net = Net(tmp)
         server = await net.server(send_timeout=0.5)
         _, w = await net.raw("bad")
         await next_event(server, "bad", "_connected")
@@ -259,7 +252,7 @@ async def test_close_with_stuck_peer(kind: str):
         elapsed = time.monotonic() - start
         assert elapsed < commslib.CLOSE_TIMEOUT + 3, f"close() took {elapsed:.1f}s"
         w.close()
-    print(f"PASS [{kind}] close() with a stuck peer finished in {elapsed:.1f}s")
+    print(f"PASS close() with a stuck peer finished in {elapsed:.1f}s")
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +263,7 @@ async def test_tcp_star():
     """Over one TLS port: seats by certificate, then 1:1, multicast and broadcast."""
     seats = ["p1", "p2", "p3"]
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        net = Net("tcp", tmp)
+        net = Net(tmp)
         server = await net.server(seats=seats)
         clients = {p: await net.client(p) for p in seats}
         await server.wait_for_players(timeout=3)
@@ -293,14 +286,14 @@ async def test_tcp_star():
         for c in clients.values():
             await c.close()
         await server.close()
-    print(f"PASS [tcp] 3 players on one port ({cipher[1]}, {cipher[0]}), "
+    print(f"PASS 3 players on one port ({cipher[1]}, {cipher[0]}), "
           f"1:1/multicast/broadcast {got}")
 
 
 async def test_tcp_socket_options():
     """TCP_NODELAY and keepalive are on, at both ends."""
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        net = Net("tcp", tmp)
+        net = Net(tmp)
         server = await net.server()
         client = await net.client("good")
         await next_event(server, "good", "_connected")
@@ -326,14 +319,14 @@ async def test_tcp_socket_options():
             assert opts == want, (end, opts)
         await client.close()
         await server.close()
-    print(f"PASS [tcp] both ends: {opts}")
+    print(f"PASS both ends: {opts}")
 
 
 async def test_tcp_refusals():
     """Certificate for no seat, HELLO for someone else's seat, taken seat, wrong
     first frame, silent peers -- all turned away without taking a seat."""
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        net = Net("tcp", tmp)
+        net = Net(tmp)
         server = await net.server()
 
         try:
@@ -343,7 +336,7 @@ async def test_tcp_refusals():
             refusal = str(e)
         assert "which is not a seat" in refusal, refusal
         ev = await next_event(server, None, "_rejected")
-        print(f"PASS [tcp] cert for no seat refused: client got {refusal!r}, server got {ev}")
+        print(f"PASS cert for no seat refused: client got {refusal!r}, server got {ev}")
 
         # good's (valid) certificate, but a HELLO claiming bad's seat.
         r, w = await tls_open(net.port, cert_of="good")
@@ -354,7 +347,7 @@ async def test_tcp_refusals():
         assert await r.read() == b""
         w.close()
         assert server.connected() == []
-        print(f"PASS [tcp] HELLO for another player's seat refused: {reply}")
+        print(f"PASS HELLO for another player's seat refused: {reply}")
 
         first = await net.client("good")
         try:
@@ -367,7 +360,7 @@ async def test_tcp_refusals():
         # The original occupant is undisturbed.
         await server.send_to("good", {"type": "STILL_HERE"})
         assert (await first.recv(timeout=2))["type"] == "STILL_HERE"
-        print(f"PASS [tcp] duplicate seat refused ({refusal!r}); first occupant unaffected")
+        print(f"PASS duplicate seat refused ({refusal!r}); first occupant unaffected")
 
         r, w = await tls_open(net.port, cert_of="bad")
         w.write(frame(json.dumps({"type": "VOTE", "target": "good"}).encode()))
@@ -375,7 +368,7 @@ async def test_tcp_refusals():
         assert reply == {"type": "error", "text": "expected HELLO first"}, reply
         assert await r.read() == b""            # and then it hung up
         w.close()
-        print(f"PASS [tcp] non-HELLO first frame refused: {reply}")
+        print(f"PASS non-HELLO first frame refused: {reply}")
 
         # Peers that go quiet are dropped after HELLO_TIMEOUT: one that never
         # starts TLS, and one that finishes TLS but never sends HELLO.
@@ -393,7 +386,7 @@ async def test_tcp_refusals():
                 assert data == b"", data
                 w.close()
                 assert "bad" not in server.connected()
-                print(f"PASS [tcp] peer silent {what} dropped after {elapsed:.1f}s, no seat taken")
+                print(f"PASS peer silent {what} dropped after {elapsed:.1f}s, no seat taken")
         finally:
             commslib.HELLO_TIMEOUT = saved
         ev = await next_event(server, None, "_rejected")
@@ -405,7 +398,7 @@ async def test_tcp_refusals():
 
 async def test_tcp_connect_retry_and_close():
     """A player started before the moderator keeps retrying; close() isn't held up
-    by a connection stuck in the handshake; peercred is refused over TCP."""
+    by a connection stuck in the handshake; missing TLS files fail at start()."""
     port = socket.socket()
     port.bind(("127.0.0.1", 0))
     free = port.getsockname()[1]
@@ -424,7 +417,7 @@ async def test_tcp_connect_retry_and_close():
     waited = time.monotonic() - start
     server = await server_task
     assert waited >= 0.5, waited
-    print(f"PASS [tcp] player started first connected after retrying {waited:.1f}s")
+    print(f"PASS player started first connected after retrying {waited:.1f}s")
 
     r, w = await asyncio.open_connection("127.0.0.1", free)   # never starts TLS
     await asyncio.sleep(0.1)
@@ -435,19 +428,13 @@ async def test_tcp_connect_retry_and_close():
     assert elapsed < 1.5, f"close() took {elapsed:.1f}s with a handshake pending"
     assert await asyncio.wait_for(r.read(), 2) == b""
     w.close()
-    print(f"PASS [tcp] close() with a peer mid-handshake took {elapsed:.2f}s")
-
-    try:
-        await Server().start(SEATS, check_peer_uid=True, port=0, tls_dir=PKI)
-        raise AssertionError("check_peer_uid accepted over TCP")
-    except ValueError as e:
-        print(f"PASS [tcp] check_peer_uid refused: {e}")
+    print(f"PASS close() with a peer mid-handshake took {elapsed:.2f}s")
 
     try:
         await Server().start(SEATS, port=0, tls_dir=os.path.join(PKI, "nope"))
         raise AssertionError("started without TLS files")
     except OSError as e:
-        print(f"PASS [tcp] missing TLS files fail at start(): {e}")
+        print(f"PASS missing TLS files fail at start(): {e}")
 
 
 
@@ -459,11 +446,11 @@ HB = {"heartbeat_interval": 0.2, "heartbeat_misses": 3}   # dead after 0.6s of s
 LIMIT = 0.6
 
 
-async def test_heartbeat_keeps_idle_link(kind: str):
+async def test_heartbeat_keeps_idle_link():
     """No game traffic for many heartbeat limits: the link stays up, and no
     HEARTBEAT ever reaches the game on either side."""
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        net = Net(kind, tmp)
+        net = Net(tmp)
         server = await net.server(**HB)
         client = await net.client("good", **HB)
         await next_event(server, "good", "_connected")
@@ -483,14 +470,14 @@ async def test_heartbeat_keeps_idle_link(kind: str):
         assert learned == (0.2, 0.2), learned
         await client.close()
         await server.close()
-    print(f"PASS [{kind}] idle {LIMIT * 4:.1f}s (4x the limit): still connected, "
+    print(f"PASS idle {LIMIT * 4:.1f}s (4x the limit): still connected, "
           f"no heartbeat leaked to either side; peer intervals learned {learned}")
 
 
-async def test_silent_player_detected(kind: str):
+async def test_silent_player_detected():
     """A seated peer that sends nothing at all is dropped within the limit."""
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        net = Net(kind, tmp)
+        net = Net(tmp)
         server = await net.server(**HB)
         _, w = await net.raw("bad")
         await next_event(server, "bad", "_connected")
@@ -501,21 +488,19 @@ async def test_silent_player_detected(kind: str):
         assert elapsed < LIMIT + 0.3, f"took {elapsed:.2f}s"
         w.close()
         await server.close()
-    print(f"PASS [{kind}] silent player dropped after {elapsed:.2f}s: {ev['reason']!r}")
+    print(f"PASS silent player dropped after {elapsed:.2f}s: {ev['reason']!r}")
 
 
 async def test_silent_moderator_detected():
     """A moderator that accepts but never sends: the player's recv() ends."""
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        path = os.path.join(tmp, "sock")
-
         async def mute(reader, writer):
             await fake_welcome(reader, writer)
             await reader.read()   # keep the link open, say nothing
 
-        srv = await asyncio.start_unix_server(mute, path=path)
+        srv, port = await fake_moderator(mute)
         client = Client(**HB)
-        await client.connect(path)
+        await client.connect(player_id="good", port=port, tls_dir=PKI)
         start = time.monotonic()
         try:
             await client.recv(timeout=LIMIT + 2)
@@ -526,7 +511,7 @@ async def test_silent_moderator_detected():
         assert "no heartbeat" in reason and elapsed < LIMIT + 0.3, (reason, elapsed)
         await client.close()
         srv.close()
-    print(f"PASS [unix] silent moderator: player's recv() raised after {elapsed:.2f}s: {reason!r}")
+    print(f"PASS silent moderator: player's recv() raised after {elapsed:.2f}s: {reason!r}")
 
 
 class BlackHoleProxy:
@@ -578,7 +563,7 @@ class BlackHoleProxy:
 async def test_blackhole_both_ends_notice():
     """The network drops everything silently: BOTH ends notice within the limit."""
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        net = Net("tcp", tmp)
+        net = Net(tmp)
         server = await net.server(**HB)
         proxy = BlackHoleProxy(net.port)
         proxy_port = await proxy.start()
@@ -605,7 +590,7 @@ async def test_blackhole_both_ends_notice():
         await client.close()
         await server.close()
         proxy.server.close()
-    print(f"PASS [tcp] black-holed link: moderator dropped the player after {m_time:.2f}s, "
+    print(f"PASS black-holed link: moderator dropped the player after {m_time:.2f}s, "
           f"player gave up on the moderator after {p_time:.2f}s ({p_reason!r})")
 
 
@@ -614,7 +599,7 @@ async def test_peer_interval_respected():
     every 0.5s isn't dropped by a moderator that beats every 0.1s (whose own
     interval x misses would be just 0.3s)."""
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        net = Net("tcp", tmp)
+        net = Net(tmp)
         server = await net.server(heartbeat_interval=0.1, heartbeat_misses=3)
         client = await net.client("good", heartbeat_interval=0.5, heartbeat_misses=3)
         await next_event(server, "good", "_connected")
@@ -623,7 +608,7 @@ async def test_peer_interval_respected():
         assert server._sessions["good"].conn.peer_interval == 0.5
         await client.close()
         await server.close()
-    print("PASS [tcp] moderator (0.1s x 3) kept a player that beats every 0.5s: "
+    print("PASS moderator (0.1s x 3) kept a player that beats every 0.5s: "
           "the limit follows the sender's interval")
 
 
@@ -720,7 +705,7 @@ async def test_resume_after_blackhole():
     order.
     """
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        net = Net("tcp", tmp)
+        net = Net(tmp)
         server = await net.server(resume_timeout=10, **HB)
         proxy = BlackHoleProxy(net.port)
         client = await net.client("good", port=await proxy.start(), **HB)
@@ -756,7 +741,7 @@ async def test_resume_after_blackhole():
         await client.close()
         await server.close()
         proxy.server.close()
-    print(f"PASS [tcp] partition: moderator replayed {resumed['replayed']} messages lost in "
+    print(f"PASS partition: moderator replayed {resumed['replayed']} messages lost in "
           f"flight; player got M {got} after its first, the moderator got C {sent_back} "
           f"-- each exactly once, in order")
 
@@ -770,7 +755,7 @@ async def test_takeover_and_dedupe():
     duplicate.
     """
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        net = Net("tcp", tmp)
+        net = Net(tmp)
         # Slow moderator heartbeats: its next ack would come 1s after the
         # message, and it won't notice the cut for a long time.
         server = await net.server(resume_timeout=10, heartbeat_interval=1.0, heartbeat_misses=20)
@@ -798,20 +783,20 @@ async def test_takeover_and_dedupe():
         await client.close()
         await server.close()
         proxy.server.close()
-    print(f"PASS [tcp] player reconnected before the moderator noticed: new link took over "
+    print(f"PASS player reconnected before the moderator noticed: new link took over "
           f"(events {kinds}); the replayed C1 was dropped as a duplicate")
 
 
 async def test_resume_refusals():
     """A session can only be resumed with its own token, and only while it lasts."""
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        net = Net("unix", tmp)
+        net = Net(tmp)
         server = await net.server(resume_timeout=0.5, **HB)
         client = await net.client("good", **HB)
         await next_event(server, "good", "_connected")
 
         async def hello(token, ack=0):
-            r, w = await asyncio.open_unix_connection(player_socket_path("good", tmp))
+            r, w = await tls_open(net.port, "good")
             w.write(frame(json.dumps({"type": "HELLO", "player": "good", "token": token,
                                       "ack": ack}).encode()))
             reply = await read_frame(r)
@@ -838,14 +823,14 @@ async def test_resume_refusals():
         assert "did not come back within" in ev["reason"], ev
         assert "unknown or expired session token" in expired["text"], expired
         await server.close()
-    print(f"PASS [unix] no token -> {no_token['text']!r}; wrong token -> refused; ack ahead -> "
+    print(f"PASS no token -> {no_token['text']!r}; wrong token -> refused; ack ahead -> "
           f"refused; crashed player's seat held {held:.2f}s, then its token -> refused")
 
 
 async def test_bye_both_ways():
     """BYE means "on purpose": no away period, no reconnect attempts."""
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        net = Net("tcp", tmp)
+        net = Net(tmp)
         server = await net.server(resume_timeout=30, **HB)
         quitter = await net.client("good", **HB)
         stayer = await net.client("bad", **HB)
@@ -867,14 +852,14 @@ async def test_bye_both_ways():
         took = time.monotonic() - start
         assert "ended the session" in ended and took < 1, (ended, took)
         await stayer.close()
-    print(f"PASS [tcp] player quit -> moderator: {reason!r} at once; moderator shut down -> "
+    print(f"PASS player quit -> moderator: {reason!r} at once; moderator shut down -> "
           f"player: {ended!r} after {took:.2f}s, no reconnect attempt")
 
 
-async def test_resume_over_unix():
-    """Resume works over UNIX too: the same socket, the same token."""
+async def test_resume_after_reset():
+    """The link is reset (not black-holed): both ends know at once, and resume."""
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        net = Net("unix", tmp)
+        net = Net(tmp)
         server = await net.server(resume_timeout=10, **HB)
         client = await net.client("good", **HB)
         await next_event(server, "good", "_connected")
@@ -886,14 +871,14 @@ async def test_resume_over_unix():
         assert got == ["_reconnecting", "_resumed", "WHILE_AWAY"], got
         await client.close()
         await server.close()
-    print(f"PASS [unix] link broken -> away -> resumed ({ev}); the message sent while away "
+    print(f"PASS link reset -> away -> resumed ({ev}); the message sent while away "
           f"arrived after it: {got}")
 
 
 async def test_lobby_rejoin_vs_locked_roster():
     """Before the game starts a player who left can join again; after, not."""
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        net = Net("tcp", tmp)
+        net = Net(tmp)
         server = await net.server(**HB)
         first = await net.client("good", **HB)
         await first.close()
@@ -910,7 +895,7 @@ async def test_lobby_rejoin_vs_locked_roster():
             refusal = str(e)
         assert "has ended and the game has started" in refusal, refusal
         await server.close()
-    print(f"PASS [tcp] left the lobby and rejoined; after lock_roster(): {refusal!r}")
+    print(f"PASS left the lobby and rejoined; after lock_roster(): {refusal!r}")
 
 
 async def test_outbox_overflow():
@@ -918,7 +903,7 @@ async def test_outbox_overflow():
     saved, commslib.MAX_OUTBOX = commslib.MAX_OUTBOX, 5
     try:
         with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-            net = Net("unix", tmp)
+            net = Net(tmp)
             server = await net.server(resume_timeout=30, **HB)
             client = await net.client("good", **HB)
             await next_event(server, "good", "_connected")
@@ -937,7 +922,7 @@ async def test_outbox_overflow():
             await server.close()
     finally:
         commslib.MAX_OUTBOX = saved
-    print(f"PASS [unix] away player's outbox full (limit 5): send_to raised {err!r}, "
+    print(f"PASS away player's outbox full (limit 5): send_to raised {err!r}, "
           "session ended")
 
 
@@ -949,7 +934,7 @@ async def test_close_waits_for_away():
     game) before close() says BYE. Without it, the player finds nobody there.
     """
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        net = Net("tcp", tmp)
+        net = Net(tmp)
         server = await net.server(resume_timeout=30, **HB)
         proxy = BlackHoleProxy(net.port)
         client = await net.client("good", port=await proxy.start(), **HB)
@@ -990,25 +975,23 @@ async def test_close_waits_for_away():
         await server.close()
         await client.close()
         proxy.server.close()
-    print(f"PASS [tcp] game over while a player was away: waited {waited:.2f}s for it to "
+    print(f"PASS game over while a player was away: waited {waited:.2f}s for it to "
           f"resume and acknowledge, it got {got[-1]} then BYE; unreachable player: gave up "
           f"after {bounded:.2f}s")
 
 
 async def main():
-    for kind in ("unix", "tcp"):
-        await test_bad_frames(kind)
-        await test_send_timeout(kind)
-        await test_close_with_stuck_peer(kind)
+    await test_bad_frames()
+    await test_send_timeout()
+    await test_close_with_stuck_peer()
     await test_client_sentinel_on_garbage()
     await test_client_sentinel_on_unexpected_error()
     await test_tcp_star()
     await test_tcp_socket_options()
     await test_tcp_refusals()
     await test_tcp_connect_retry_and_close()
-    for kind in ("unix", "tcp"):
-        await test_heartbeat_keeps_idle_link(kind)
-        await test_silent_player_detected(kind)
+    await test_heartbeat_keeps_idle_link()
+    await test_silent_player_detected()
     await test_silent_moderator_detected()
     await test_blackhole_both_ends_notice()
     await test_peer_interval_respected()
@@ -1018,7 +1001,7 @@ async def main():
     await test_takeover_and_dedupe()
     await test_resume_refusals()
     await test_bye_both_ways()
-    await test_resume_over_unix()
+    await test_resume_after_reset()
     await test_lobby_rejoin_vs_locked_roster()
     await test_outbox_overflow()
     await test_close_waits_for_away()

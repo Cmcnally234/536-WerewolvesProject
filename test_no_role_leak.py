@@ -45,8 +45,8 @@ def strings_in(obj):
             yield from strings_in(v)
 
 
-def run_game(seed: int, sock_dir: str, log_dir: str) -> dict[str, list[dict]]:
-    mod_net, player_net = net_args(sock_dir)
+def run_game(seed: int, log_dir: str) -> dict[str, list[dict]]:
+    mod_net, player_net = net_args()
     mod = subprocess.Popen(
         [sys.executable, os.path.join(HERE, "moderator.py"), *PLAYERS,
          *mod_net, "--seed", str(seed), "--join-timeout", "15",
@@ -122,10 +122,9 @@ def self_test() -> None:
 def main() -> None:
     self_test()
     villagers_checked = 0
-    with tempfile.TemporaryDirectory(prefix="ww-") as tmp:   # short path: AF_UNIX limit
+    with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
         for seed in SEEDS:
-            sock_dir = os.path.join(tmp, f"s{seed}")
-            received = run_game(seed, sock_dir, tmp)
+            received = run_game(seed, tmp)
             for pid, msgs in received.items():
                 check_everyone(pid, msgs)
                 my_role = next(m["role"] for m in msgs if m["type"] == "ROLE_ASSIGN")

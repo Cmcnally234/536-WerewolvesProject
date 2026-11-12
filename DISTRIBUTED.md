@@ -1,18 +1,27 @@
 # Werewolf, distributed (Project 2)
 
-This document describes the wire protocol between the moderator and the players once they run on different machines. It grows with each stage; sections for later stages are marked *not yet implemented*.
+This document describes the wire protocol between the moderator and the players: TCP + mutual TLS, the same whether they share a machine or not.
 
-All networking lives in `commslib.py`. `moderator.py` and `player.py` see the same API as in Project 1. The only differences are a few keyword arguments (`host`, `port`, `tls_dir`; `heartbeat_interval`, `heartbeat_misses` and the server's `resume_timeout` on the constructors), the matching command-line flags (`--host`, `--port`, `--tls`, `--heartbeat`, `--heartbeat-misses`, `--resume-timeout`), one call (`Server.lock_roster()`), and four inbox event types (`_away` and `_resumed` on the moderator, `_reconnecting` and `_resumed` on the player).
+All networking lives in `commslib.py`. `moderator.py` and `player.py` use the same `Server`/`Client` calls as in Project 1 (git tag `project1`, which used UNIX domain sockets). What changed for them:
+- addressing is by `host`, `port` and `tls_dir`, instead of a socket directory;
+- the constructors take `heartbeat_interval`, `heartbeat_misses` and the server's `resume_timeout`;
+- the matching command-line flags: `--host`, `--port`, `--tls`, `--heartbeat`, `--heartbeat-misses`, `--resume-timeout`;
+- two calls: `Server.lock_roster()` and `Server.wait_for_delivery()`;
+- four inbox event types: `_away` and `_resumed` on the moderator, `_reconnecting` and `_resumed` on the player.
 
-## Transports
+## Transport
 
-| | UNIX (Project 1) | TCP + mutual TLS (Project 2) |
-|---|---|---|
-| Listening sockets | one per seat, `/run/werewolf/<seat>/sock` | one, `host:port` |
-| Who is this connection? | the socket it arrived on (file permissions; optionally SO_PEERCRED) | the CN of the player's TLS certificate, verified against the game CA |
-| Selected by | no `port` | `Server.start(..., port=N, tls_dir=D)`, `Client.connect(port=N, player_id=..., tls_dir=D)` |
+| | |
+|---|---|
+| Listening socket | one, `host:port` (default `127.0.0.1:5555`) |
+| Who is this connection? | the CN of the player's TLS certificate, verified against the game CA |
+| Set up by | `Server.start(players, host=, port=, tls_dir=)`, `Client.connect(player_id=, host=, port=, tls_dir=)` |
 
-Both transports use the same framing: a 4-byte big-endian length, then that many bytes of UTF-8 JSON. The body must be a JSON object, and frames over 1 MiB are refused. A frame that breaks these rules is a `ProtocolError`, and the receiver hangs up. Over TCP the frames travel inside TLS. There is no plaintext TCP mode.
+Framing: a 4-byte big-endian length, then that many bytes of UTF-8 JSON. The body must be a JSON object, and frames over 1 MiB are refused. A frame that breaks these rules is a `ProtocolError`, and the receiver hangs up.
+
+The frames always travel inside TLS: there is no plaintext mode, no flag or environment variable that turns TLS off, and no code path that skips certificate verification. Both ends use `CERT_REQUIRED`, a TLS 1.3 minimum and only the game CA; the player also checks the moderator's hostname.
+
+One environment variable to know about: Python's `ssl.create_default_context()` honours `SSLKEYLOGFILE`. If it is set when the moderator or a player starts, that process writes its TLS session secrets to the named file, and anyone with that file and a packet capture can decrypt the game. Don't set it outside debugging.
 
 ## Certificates (`make_certs.sh`)
 
@@ -37,13 +46,12 @@ Both transports use the same framing: a 4-byte big-endian length, then that many
 
 ## Handshake
 
-Every connection, on both transports, starts the same way once the peer is identified:
+Every connection starts the same way:
 
 ```
 player                                         moderator
-  | -- connect (TCP: + TLS 1.3, see below) -------> |   CONNECT_TIMEOUT (5s)
-  |                                                 |   identity: UNIX = which socket,
-  |                                                 |   TCP = CN of the verified cert
+  | -- TCP connect + TLS 1.3 (see below) ---------> |   CONNECT_TIMEOUT (5s)
+  |                                                 |   identity = CN of the verified cert
   | -- HELLO {"player": "p3",                       |   HELLO_TIMEOUT (5s)
   |           "token": null | "<session token>",    |
   |           "ack": <last seq I delivered>} -----> |
@@ -66,7 +74,9 @@ The TCP part, before the `HELLO`:
   |    we dialled                                   |
 ```
 
-**Where the seat comes from:** the socket it arrived on (UNIX), or the CN of the player's verified certificate (TCP). It is never taken from a message field, so it's something the peer can't forge. The `HELLO`'s `player` is only checked against it. A certificate that doesn't match the seat it asks for is refused, so a copied certificate can't be used to sit in someone else's seat. On UNIX `player` may be left out.
+**Where the seat comes from:** the CN of the player's verified certificate. It is never taken from a message field, so it's something the peer can't forge without stealing that player's key. The `HELLO`'s `player` is only checked against it. A certificate that doesn't match the seat it asks for is refused, so a copied certificate can't be used to sit in someone else's seat.
+
+**Why that ties seats to Linux users:** on each machine, `playerN`'s key is `playerN:playerN 0600`, in a `0700` directory. Only that user (and root) can read it, so only that user can present the certificate. In Project 1, SO_PEERCRED let the moderator ask the kernel for the connecting uid, which also caught root. Over TCP the kernel can't vouch for a remote user, so possession of the key is the proof.
 
 **Why the moderator runs the TLS handshake itself:** it calls `StreamWriter.start_tls()` per connection rather than passing `ssl=` to `start_server`. With `start_server(ssl=)`, a failed handshake is only logged by asyncio and never reaches our code. Running it ourselves turns every failure into a `_rejected` event, which the lobby prints.
 
@@ -167,11 +177,11 @@ A **link** failure and a **session** ending are now different things. A broken l
 ## Heartbeat
 
 ```
-{"type": "HEARTBEAT", "interval": 2.0}      both directions, both transports
+{"type": "HEARTBEAT", "interval": 2.0, "ack": 12}      both directions
 ```
 
 - **Both ends** send one as soon as the link is up (after `WELCOME` on TCP), then every `interval` seconds. They're sent unconditionally, not only when idle, which keeps the logic to one loop.
-- **The receiver's `Connection.recv()` swallows them,** so the game never sees one. `HEARTBEAT` is therefore a reserved message type.
+- **The receiver never passes them on:** `Connection.recv()` checks the interval and stamps `last_heard`, then `_Session.on_frame()` takes the piggybacked `ack` and drops the frame, so the game never sees one. `HEARTBEAT` is therefore a reserved message type.
 - **Any frame counts as a sign of life, heartbeat or game message.** Each received frame updates `Connection.last_heard`.
 - **Dead peer:** if nothing at all arrives for `misses × peer_interval` seconds, `Connection.heartbeat()` aborts the link with the reason `no heartbeat for 6.0s (limit 3 x 2s)`. The reader then fails with that reason:
   - the moderator gets `_disconnected` with it;

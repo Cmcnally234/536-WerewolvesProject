@@ -6,7 +6,7 @@ test_game.py -- whole games: win conditions, GAME_OVER, clean shutdown.
 Real processes (moderator + bot players, no sudo). Checks that:
   - games run to a winner, and the winner matches the rules
   - every player, dead or alive, gets GAME_OVER and exits with status 0
-  - all socket files are gone afterwards
+  - the moderator's port is released afterwards
   - SIGTERM / Ctrl-C on the moderator still ends the game cleanly
   - a player killed mid-game doesn't break anything for the others
   - a player frozen mid-game (SIGSTOP) is marked away within the heartbeat
@@ -24,7 +24,7 @@ import threading
 import time
 
 import roles
-from testnet import net_args
+from testnet import net_args, port_released
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FAST = ["--night-timeout", "5", "--discussion", "0.5", "--vote-timeout", "3"]
@@ -35,9 +35,9 @@ class Run:
 
     def __init__(self, tmp, players, seed, extra=(), modes=None, player_extra=()):
         self.players = players
-        self.sock_dir = os.path.join(tmp, "s")
         self.logs = {p: os.path.join(tmp, f"{p}.jsonl") for p in players}
-        mod_net, player_net = net_args(self.sock_dir)
+        mod_net, player_net = net_args()
+        self.port = int(mod_net[mod_net.index("--port") + 1])
         self.mod = subprocess.Popen(
             [sys.executable, os.path.join(HERE, "moderator.py"), *players,
              *mod_net, "--seed", str(seed), *extra],
@@ -97,9 +97,9 @@ class Run:
                     for p, path in self.logs.items()}
         return out, codes, received
 
-    def leftover_sockets(self):
-        return [p for p in self.players
-                if os.path.exists(os.path.join(self.sock_dir, p, "sock"))]
+    def port_left_open(self) -> bool:
+        """True if something is still listening on the game's port."""
+        return not port_released(self.port)
 
 
 def test_winner_rules():
@@ -123,7 +123,7 @@ def test_full_games():
             assert run.mod.returncode == 0, out
             for p, (code, err) in codes.items():
                 assert code == 0, f"{p} exited {code}:\n{err}"
-            assert not run.leftover_sockets(), f"socket files left behind: {run.leftover_sockets()}"
+            assert not run.port_left_open(), f"port {run.port} still in use after the game"
             assert "all sockets closed" in out
 
         overs = [msgs[-1] for msgs in received.values()]
@@ -136,7 +136,7 @@ def test_full_games():
         dead_players = [p for p in players if p not in final["alive"]]
         results.append(f"{len(players)}p seed {seed}: {final['winner'] or 'draw'} "
                        f"({len(dead_players)} dead, all got GAME_OVER)")
-    print("PASS full games, all exit 0, no socket files left:\n  " + "\n  ".join(results))
+    print("PASS full games, all exit 0, port released:\n  " + "\n  ".join(results))
 
 
 def test_moderator_signal(sig, name):
@@ -150,17 +150,17 @@ def test_moderator_signal(sig, name):
         time.sleep(0.3)
         run.mod.send_signal(sig)
         out, codes, received = run.finish(timeout=10)
-        leftovers = run.leftover_sockets()
+        left_open = run.port_left_open()
 
     assert run.mod.returncode == 1, out
     assert "shutdown requested" in out and "all sockets closed" in out, out
-    assert not leftovers, f"socket files left behind: {leftovers}"
+    assert not left_open, f"port {run.port} still in use after shutdown"
     for p, (code, err) in codes.items():
         assert code == 0, f"{p} exited {code}:\n{err}"
         last = received[p][-1]
         assert last["type"] == "GAME_OVER" and last["winner"] is None, last
     print(f"PASS {name} to moderator mid-night: every player got GAME_OVER "
-          f"('{last['text']}'), all exit 0, no socket files left")
+          f"('{last['text']}'), all exit 0, port released")
 
 
 def test_player_killed_midgame():
@@ -170,12 +170,12 @@ def test_player_killed_midgame():
         run.wait_for("PHASE", "p3")
         run.procs["p3"].send_signal(signal.SIGTERM)
         out, codes, received = run.finish()
-        leftovers = run.leftover_sockets()
+        left_open = run.port_left_open()
 
     assert run.mod.returncode == 0, out
     assert "p3 disconnected" in out, out
     assert codes["p3"][0] == 0, f"killed player should still exit cleanly: {codes['p3']}"
-    assert not leftovers
+    assert not left_open
     others = [p for p in players if p != "p3"]
     for p in others:
         assert received[p][-1]["type"] == "GAME_OVER", f"{p} never saw the end"

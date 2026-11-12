@@ -1,5 +1,7 @@
 # Architecture
 
+> **This document describes Project 1** (git tag `project1`): UNIX domain sockets on one machine. Project 2 added TCP + mutual TLS, heartbeats and resumable sessions; that design is in [DISTRIBUTED.md](DISTRIBUTED.md). Some internal names used below have changed since (`_serve_player` is now `_serve_link`, the client's `_read_loop` is now `_run`, and the send lock was replaced by synchronous `Connection.write()`).
+
 A Werewolf / Mafia game in which **every player is a separate OS process running as a separate Linux user**. All communication goes through one file, `commslib.py`, which wraps **UNIX domain stream sockets driven by asyncio**. Python 3.14, standard library only.
 
 ## 1. Processes, users and the star topology

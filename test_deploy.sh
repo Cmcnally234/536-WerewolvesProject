@@ -81,8 +81,8 @@ expect 1 "doesn't list '10.9.9.9'" "--host that isn't in the moderator's certifi
     cx ww-mod /src/run_game.sh --host 10.9.9.9 --port 5555 -R 3
 expect 1 "can't reach 127.0.0.1" "remote seats with a loopback --host" \
     cx ww-mod /src/run_game.sh --port 5555 -R 3
-expect 1 "need --port" "-R without --port" \
-    cx ww-mod /src/run_game.sh -R 3
+expect 1 "must be a number" "a --port that isn't a number" \
+    cx ww-mod /src/run_game.sh --port 55x5
 echo
 
 echo "== one game across three hosts =="

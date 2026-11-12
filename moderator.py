@@ -5,10 +5,11 @@ The moderator is the only process that knows everyone's role. Players only
 ever learn what the moderator chooses to send them, which is how roles stay
 secret even though every message passes through one process.
 
-    local dev:   python3 moderator.py p1 p2 p3 p4 --dir /tmp/ww --local
-    over TLS:    python3 moderator.py p1 p2 p3 p4 --port 5555 --tls DIR [--host 0.0.0.0]
-    real users:  sudo -u modbot python3 /opt/werewolf/moderator.py \\
-                     --peercred player1 player2 player3 player4
+Every player connects over TCP + mutual TLS (see commslib.py):
+
+    local dev:   python3 moderator.py p1 p2 p3 p4 --tls /tmp/pki      (./make_certs.sh -o /tmp/pki ...)
+    real users:  sudo -u modbot python3 /opt/werewolf/moderator.py player1 player2 player3 player4
+    other hosts: ... --host <this machine's address, as in its certificate>
 
 Message routing summary (who receives what):
     ROLE_ASSIGN     1:1        each player, their own role only
@@ -27,14 +28,13 @@ Message routing summary (who receives what):
 
 import argparse
 import asyncio
-import os
 import random
 import signal
 import sys
 from dataclasses import dataclass, field
 
 import roles
-from commslib import (DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_HEARTBEAT_MISSES,
+from commslib import (DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_HEARTBEAT_MISSES, DEFAULT_PORT,
                       DEFAULT_RESUME_TIMEOUT, DEFAULT_TLS_DIR, Server)
 
 
@@ -597,11 +597,11 @@ async def session(server: Server, args, holder: dict) -> int:
 async def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("players", nargs="+")
-    parser.add_argument("--dir", default="/run/werewolf")
-    parser.add_argument("--port", type=int,
-                        help="listen on TCP instead of UNIX sockets (0 = any free port)")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT,
+                        help="TCP port to listen on (0 = any free port; default %(default)s)")
     parser.add_argument("--host", default="127.0.0.1",
-                        help="TCP address to listen on (default loopback only)")
+                        help="address to listen on (default loopback only); players on "
+                             "other machines need one that's in the moderator's certificate")
     parser.add_argument("--tls", default=DEFAULT_TLS_DIR,
                         help=f"TLS files from make_certs.sh (default {DEFAULT_TLS_DIR})")
     parser.add_argument("--heartbeat", type=float, default=DEFAULT_HEARTBEAT_INTERVAL,
@@ -615,8 +615,6 @@ async def main() -> int:
     parser.add_argument("--linger", type=float, default=30.0,
                         help="after the game, wait up to this long for every player to "
                              "acknowledge the result (default %(default)s)")
-    parser.add_argument("--peercred", action="store_true",
-                        help="enforce SO_PEERCRED (player ids must be Linux users)")
     parser.add_argument("--seed", type=int, help="fix the role shuffle")
     parser.add_argument("--join-timeout", type=float, default=120.0)
     parser.add_argument("--night-timeout", type=float, default=Timers.night)
@@ -624,22 +622,11 @@ async def main() -> int:
     parser.add_argument("--vote-timeout", type=float, default=Timers.vote)
     parser.add_argument("--max-rounds", type=int, default=20,
                         help="end in a draw after this many night+day rounds")
-    parser.add_argument("--local", action="store_true",
-                        help="create per-seat dirs (dev only; setup_users.sh "
-                             "does this for real users)")
     args = parser.parse_args()
 
     if not roles.MIN_PLAYERS <= len(args.players) <= roles.MAX_PLAYERS:
         print(f"need {roles.MIN_PLAYERS}-{roles.MAX_PLAYERS} players", file=sys.stderr)
         return 2
-    if args.port is not None and (args.peercred or args.local):
-        print("--peercred and --local are for UNIX sockets; drop them with --port",
-              file=sys.stderr)
-        return 2
-    if args.local:
-        for pid in args.players:
-            os.makedirs(os.path.join(args.dir, pid), exist_ok=True)
-
     try:
         server = Server(heartbeat_interval=args.heartbeat,
                         heartbeat_misses=args.heartbeat_misses,
@@ -648,13 +635,11 @@ async def main() -> int:
         print(e, file=sys.stderr)
         return 2
     try:
-        await server.start(args.players, base_dir=args.dir, check_peer_uid=args.peercred,
-                           host=args.host, port=args.port, tls_dir=args.tls)
+        await server.start(args.players, host=args.host, port=args.port, tls_dir=args.tls)
     except OSError as e:   # e.g. TLS key missing or unreadable, port in use
         print(f"could not start: {e}", file=sys.stderr)
         return 2
-    if server.port is not None:
-        log(f"listening on TCP+TLS {args.host}:{server.port} (certificates from {args.tls})")
+    log(f"listening on TCP+TLS {args.host}:{server.port} (certificates from {args.tls})")
 
     holder: dict = {}
     task = asyncio.create_task(session(server, args, holder))

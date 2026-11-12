@@ -24,7 +24,15 @@ CLUSTER_SRC=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")
 
 # The files a real user would have in their checkout (git ls-files), so the
 # containers get exactly the project and nothing from a local scratch area.
-cluster_files() { (cd "$CLUSTER_SRC" && git ls-files -co --exclude-standard -- '*.py' '*.sh'); }
+# Outside a git checkout (e.g. an unpacked tarball), every *.py / *.sh at the
+# top level -- which is all the project has.
+cluster_files() {
+    if git -C "$CLUSTER_SRC" rev-parse --git-dir >/dev/null 2>&1; then
+        (cd "$CLUSTER_SRC" && git ls-files -co --exclude-standard -- '*.py' '*.sh')
+    else
+        (cd "$CLUSTER_SRC" && ls -1 -- *.py *.sh)
+    fi
+}
 
 cluster_image() {
     podman image exists "$CLUSTER_IMAGE" && return 0

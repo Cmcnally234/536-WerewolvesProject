@@ -161,7 +161,7 @@ def test_live_chat_relay():
     players = PLAYERS + ["p6"]
     discussion = 2.0
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        mod_net, player_net = net_args(os.path.join(tmp, "s"))
+        mod_net, player_net = net_args()
         mod = subprocess.Popen(
             [sys.executable, os.path.join(HERE, "moderator.py"), *players, *mod_net,
              "--seed", "5", "--max-rounds", "1", "--night-timeout", "3",

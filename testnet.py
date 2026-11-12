@@ -1,11 +1,9 @@
 """
-testnet.py -- which transport the process-launching tests use.
+testnet.py -- network arguments for the process-launching tests.
 
-    python3 test_game.py                   # UNIX sockets (Project 1 setup)
-    WW_TRANSPORT=tcp python3 test_game.py  # the same games over localhost TCP + TLS
-
-Each game gets its own arguments from net_args(): a temp socket directory
-for UNIX, or a fresh free port plus a throwaway PKI for TCP.
+Every game gets a fresh free port on localhost, and every process gets the
+same throwaway PKI (made once per test process by the real make_certs.sh),
+so the tests run over exactly the TCP + mutual TLS path a real game uses.
 """
 
 import atexit
@@ -17,10 +15,6 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SEATS = ["p1", "p2", "p3", "p4", "p5", "p6"]   # every seat name the tests use
-
-TRANSPORT = os.environ.get("WW_TRANSPORT", "unix")
-if TRANSPORT not in ("unix", "tcp"):
-    raise SystemExit(f"WW_TRANSPORT must be 'unix' or 'tcp', not {TRANSPORT!r}")
 
 _pki: str | None = None
 
@@ -51,9 +45,22 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-def net_args(sock_dir: str) -> tuple[list[str], list[str]]:
-    """(moderator args, player args) for one game."""
-    if TRANSPORT == "tcp":
-        tcp = ["--port", str(free_port()), "--tls", shared_pki()]
-        return tcp, tcp
-    return ["--dir", sock_dir, "--local"], ["--dir", sock_dir]
+def port_released(port: int) -> bool:
+    """
+    True if nothing is listening on `port` any more. SO_REUSEADDR, as the
+    moderator itself uses: the game's old connections may still sit in
+    TIME_WAIT, which doesn't count -- only a listener left open does.
+    """
+    with socket.socket() as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+        return True
+
+
+def net_args() -> tuple[list[str], list[str]]:
+    """(moderator args, player args) for one game: a fresh port, the shared PKI."""
+    net = ["--port", str(free_port()), "--tls", shared_pki()]
+    return net, net

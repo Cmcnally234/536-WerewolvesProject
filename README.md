@@ -1,651 +1,174 @@
-# Werewolf: a multi-process, multi-machine game (CSE 522 P1 + P2)
+# Werewolf over TCP + mutual TLS (CSE 522 Project 2)
 
-> ## Communications library: **`commslib.py`**
->
-> - **Name:** `commslib.py`
-> - **Location:** the project's top-level directory (next to this README). `setup_users.sh` installs it, with the rest of the code, to **`/opt/werewolf/commslib.py`**.
-> - **What it is:** the **only** file in the project that touches sockets. `moderator.py` and `player.py` do all of their communication through it.
-> - **IPC primitive:** UNIX domain **stream** sockets driven by **asyncio**. Project 2 adds a TCP + mutual TLS transport through the same API (see [DISTRIBUTED.md](DISTRIBUTED.md)).
-> - **API:** see [Communications library API](#communications-library-api-commslibpy) below.
+A text-based Werewolf (Mafia) game for 4–6 players. A moderator process runs the game; every player is a separate process running as its own Linux user, on the same machine or on other machines. Every connection is TCP with mutual TLS 1.3 and certificates from a private CA; players resume after network failures without losing or duplicating messages. Python standard library only. Project 1, the single-machine version over UNIX domain sockets, is the git tag `project1`.
 
-A Werewolf / Mafia social deduction game for 4–6 players:
-- Every player is a **separate OS process running as a separate Linux user** (`player1` … `player6`).
-- A central **moderator** process runs as the user `modbot`.
-- Players connect only to the moderator (a star topology). The moderator relays messages one-to-one (1:1), to a group of players (multicast), or to everyone (broadcast).
+## Game rules
 
-## Contents
+- Roles: 2 Werewolves, 1 Seer, 1 Doctor, the rest Villagers. Each player sees only their own role (wolves also learn their partner).
+- **Night:** the wolves agree on one non-wolf to kill (at the deadline the most-voted target is taken, ties broken at random). The Seer learns whether one other player is a wolf. The Doctor protects one player, possibly themselves, but **not the same player two nights in a row**.
+- **Day:** a timed discussion, then a vote. The most votes eliminates that player; a tie or no votes eliminates nobody. Votes are final and public; you can't vote for yourself; silence counts as abstaining.
+- Anyone who doesn't act before a deadline gets a no-op (night) or abstains (vote); the game never waits forever.
+- The dead keep watching (announcements, not chat). Roles are revealed only at the end.
+- **Village wins** when no wolf is left; **wolves win** when they are at least as many as everyone else. After 20 rounds the game is a draw.
 
-1. [Requirements](#requirements)
-2. [Setup](#setup)
-3. [Compiling](#compiling)
-4. [Playing](#playing)
-5. [Communications library API (`commslib.py`)](#communications-library-api-commslibpy)
-6. [Files](#files)
-7. [Testing](#testing)
-8. [Troubleshooting](#troubleshooting)
-9. [Uninstalling](#uninstalling)
+## Architecture
 
-`ARCHITECTURE.md` explains the design in depth: the topology diagram, framing, permissions, the concurrency design, and the full message table.
+```
+          <MODERATOR_HOST>                         <PLAYER_HOST_A>
+  +-----------------------------+   TLS 1.3   +----------------------+
+  | moderator.py  (user modbot) |<===========>| player.py  (player3) |
+  |   listens on :5555          |<===========>| player.py  (player4) |
+  | player.py (player1)  --TLS--|             +----------------------+
+  | player.py (player2)  --TLS--|   TLS 1.3   +----------------------+
+  +-----------------------------+<===========>| player.py  (player5) |
+   star: players only ever talk to the         +----------------------+
+   moderator, which relays                       <PLAYER_HOST_B>
+```
 
----
+| File | What it does |
+|---|---|
+| `commslib.py` | **All networking**: framing, TLS, heartbeats, sequenced resumable sessions. Nothing else opens a socket. |
+| `moderator.py` | The game: lobby, roles, night/day/vote phases with timeouts, win checks. Run as `modbot`. |
+| `player.py` | A player: renders messages, reads the keyboard and the socket at once; `--bot` plays automatically. |
+| `roles.py` | The rules (roles, legal targets, vote counting, win check). No I/O. |
+| `setup_users.sh` / `teardown_users.sh` | Create / remove the Linux users and `/opt/werewolf` (the installed code). |
+| `make_certs.sh` | The private CA, the moderator's certificate and one per player, each key owned by its user. |
+| `run_game.sh` | One command for a whole game on this machine (moderator + bots; prints commands for humans). |
+| `deploy_remote.sh`, `run_players.sh` | Install a seat's code and key on another machine over ssh; start that machine's seats. |
+| `test_*.py`, `test_*.sh`, `testnet.py`, `cluster.sh`, `tls_*.py`, `ping_*.py` | Tests and test helpers (see Testing). |
+| `DISTRIBUTED.md` | The protocol and design in detail. `ARCHITECTURE.md` is the Project 1 design document. |
+
+The public API of `commslib.py`:
+
+| Class | Method | Purpose | Kind |
+|---|---|---|---|
+| `Server` | `start(players, host=, port=, tls_dir=)` | Listen on one TLS port for these seats | setup |
+| `Server` | `wait_for_players(timeout)` | Wait until every seat has joined | setup |
+| `Server` | `send_to(player, msg)` | Send to one player | 1:1 |
+| `Server` | `multicast(players, msg)` | Send to a subset, concurrently | multicast |
+| `Server` | `broadcast(msg)` | Send to every player still in the game | broadcast |
+| `Server` | `recv_any(timeout)` | Next message (or event such as `_away`) from any player | receive |
+| `Server` | `wait_for_delivery(timeout)`, `close()` | Wait until everyone has acknowledged; shut down | teardown |
+| `Client` | `connect(player_id=, host=, port=, tls_dir=)` | Join as a seat; reconnects by itself later | setup |
+| `Client` | `send(msg)` | Send to the moderator | 1:1 |
+| `Client` | `recv(timeout)` | Next message from the moderator | receive |
+| `Client` | `close()` | Leave the game | teardown |
 
 ## Requirements
 
-- **Linux**: UNIX domain sockets, `useradd`, `/run`. Developed and tested on Fedora 44 with SELinux enforcing.
-- **Python 3.11 or newer** (on every machine, moderator and players). It was tested on Python 3.14. It needs 3.11 because it relies on `asyncio.wait_for` raising the built-in `TimeoutError`, and on `StreamWriter.start_tls()`.
-- **Standard library only.** Nothing to `pip install`.
-- **`sudo`**, to create the game's Linux users and its socket directory.
-- **Standard system tools:** `useradd`, `groupadd`, `usermod`, `userdel`, `install`, `setsid` and `pkill`. These are present on Fedora, RHEL, Debian and Ubuntu by default.
-- **For TCP/TLS and multiple machines:** `openssl` (for `make_certs.sh`), and `ssh`/`scp` from the moderator's machine to each player machine (for `deploy_remote.sh`). An open TCP port on the moderator's machine is needed too ([firewalld rules](#opening-the-port-on-fedora-firewalld)).
-- **Optional:** `podman`, for the multi-host test `test_deploy.sh`.
-- **A terminal for each human player.** Bot players need no terminal.
+- Linux. Developed and tested on Fedora 44 (SELinux enforcing).
+- Python 3.11 or newer on every machine (tested on 3.14). No pip packages; nothing to compile.
+- `openssl` (for `make_certs.sh`) and `sudo` access.
+- Several machines: `ssh`/`scp` from the moderator's machine to each player machine, and the game port open in the moderator's firewall (firewalld on Fedora).
+- Fault-injection and multi-host tests: `podman` (rootless). `tc` and `iptables` run *inside* the test containers; your machine doesn't need them.
 
-## Setup
-
-1. **Put the project directory anywhere.** Your home directory is fine: the setup script copies the code out to `/opt/werewolf`, because the game users can't read files inside your home directory.
-
-2. **Create the users, install the code, and build the socket directory:**
-
-   ```bash
-   cd werewolf-project-dir            # the directory containing this README
-   sudo ./setup_users.sh              # 5 player seats (default)
-   sudo N_PLAYERS=6 ./setup_users.sh  # or 4, 5 or 6 seats
-   ```
-
-   This creates the following. It's safe to re-run: existing users are kept, and permissions are re-applied.
-
-   | Created | Details |
-   |---|---|
-   | Users `modbot`, `player1` … `playerN` | System accounts with no home directory and a `nologin` shell. They only exist to run game processes via `sudo -u`. If users with these names already exist, they are reused. |
-   | Group `werewolf` | `modbot` plus every player. |
-   | `/opt/werewolf/` | `root:werewolf`, mode `0750`. A copy of every `*.py` file. |
-   | `/run/werewolf/` | `modbot:werewolf`, mode `0750`. |
-   | `/run/werewolf/playerN/` | `modbot:playerN`, mode `2750` (setgid). The moderator creates player N's socket here. Only `playerN` (and `modbot`) can reach it. |
-
-3. **Verify that each player can reach only its own socket** (optional, about 10s):
-
-   ```bash
-   sudo ./test_permissions.sh         # expect: 8 passed, 0 failed
-   ```
-
-> **Re-run `sudo ./setup_users.sh`:**
-> - **after every code change.** The game runs the copy in `/opt/werewolf`, and `run_game.sh` refuses to start on a stale copy.
-> - **after every reboot.** `/run` is a tmpfs, so `/run/werewolf` disappears at boot.
-
-## Compiling
-
-**No compilation or build step is needed.** Everything is plain Python 3 run directly by the interpreter, plus three bash scripts. There are no third-party dependencies and no virtual environment.
-
-## Playing
-
-### Quick start: one command
+## Quick start (one machine)
 
 ```bash
-sudo ./run_game.sh                    # 5 seats, all bots: watch a whole game play out
-sudo ./run_game.sh -H 1,2             # player1 and player2 are humans; seats 3-5 are bots
+tar xzf werewolf.tar.gz && cd werewolf        # made with: git archive --prefix=werewolf/ -o werewolf.tar.gz HEAD
+sudo ./setup_users.sh            # users modbot, player1..player5; code -> /opt/werewolf
+sudo ./make_certs.sh             # CA + certificates in /etc/werewolf/tls (each key owned by its user)
+sudo ./run_game.sh -- --night-timeout 10 --discussion 5 --vote-timeout 10   # a whole game, all bots
 ```
 
-`run_game.sh`:
-- starts the moderator **in the terminal you run it from**, as user `modbot`;
-- starts each bot seat in the background, as its own Linux user;
-- prints the command for each human seat.
+The moderator runs in that terminal and prints every role, so keep it hidden from players. The summary ends with each player's exit status and `port 5555: released`. For 4 or 6 seats: `sudo N_PLAYERS=6 ./setup_users.sh`, `sudo N_PLAYERS=6 ./make_certs.sh`, then `sudo ./run_game.sh -n 6`.
 
-For each human seat, open a **new terminal** and run the printed command:
+To play yourself, let the bots fill the other seats and start your seat in a second terminal:
 
 ```bash
-sudo -u player1 python3 /opt/werewolf/player.py player1
+sudo ./run_game.sh -H 1 -- --join-timeout 300                   # terminal 1: moderator + bots for seats 2-5
+sudo -u player1 python3 /opt/werewolf/player.py player1          # terminal 2: you, as Linux user player1
 ```
 
-**Keep the moderator's terminal hidden from the players: it prints every role.**
+Commands in the game: `/kill`, `/peek`, `/heal <name|number>` (night), `/w <msg>` (wolf whisper), `/vote <name|number|none>`, `/role`, `/help`, `/quit`; any other line is day chat. `run_game.sh -S 4` makes seat 4 a bot that never answers, to show the timeouts. After any code change, re-run `sudo ./setup_users.sh`; `run_game.sh` refuses to start on stale code in `/opt/werewolf`.
 
-The moderator waits up to 120s for every seat to connect, then the game begins. Ctrl-C in the moderator's terminal ends the game cleanly for everyone. Logs are written to `/tmp/werewolf-run.XXXXXX/`.
+## Multi-host setup
 
-| `run_game.sh` option | Meaning |
-|---|---|
-| `-n 4\|5\|6` | Number of seats (default 5; you need at least this many from `setup_users.sh`) |
-| `-H 1,2` | Seats played by humans (default: none) |
-| `-S 4` | Seats played by *silent* bots that never respond. Use this to see the moderator's timeouts. |
-| `--port N` | Play over TCP + mutual TLS on port N instead of UNIX sockets (needs `sudo ./make_certs.sh`) |
-| `--host ADDR` | With `--port`: the moderator's address (default `127.0.0.1`). The moderator listens there, local seats connect there, and remote players must use it, so it must be one of the names/IPs in the moderator's certificate. `run_game.sh` checks this before starting. |
-| `--tls DIR` | Certificate directory (default `/etc/werewolf/tls`) |
-| `-R 3,4` | Seats played **on other machines** (see [Playing across machines](#playing-across-machines)); the command to run there is printed |
-| `--open-firewall` | Open `--port` in firewalld for this game only (a runtime rule, removed when the game ends) |
-| `-- ARGS` | Everything after `--` is passed to `moderator.py`, e.g. `-- --night-timeout 20 --discussion 30 --join-timeout 300` |
-| `-h` | Show the usage |
-
-### Starting the processes by hand (equivalent to `run_game.sh`)
+*Verified only between podman containers (`test_deploy.sh`), not on separate physical machines.*
 
 ```bash
-sudo -u modbot  python3 /opt/werewolf/moderator.py --peercred player1 player2 player3 player4 player5
-sudo -u player1 python3 /opt/werewolf/player.py player1           # human, own terminal
-sudo -u player3 python3 /opt/werewolf/player.py player3 --bot     # bot
+# On the moderator's machine. The certificate must list every name/IP players will dial.
+sudo ./setup_users.sh
+sudo ./make_certs.sh -s DNS:localhost -s IP:127.0.0.1 -s DNS:<MODERATOR_HOST> -s IP:<MODERATOR_IP>
+./deploy_remote.sh <USER>@<PLAYER_HOST_A> player3 player4   # code + only these seats' keys, via scp/ssh
+./deploy_remote.sh <USER>@<PLAYER_HOST_B> player5
+sudo ./run_game.sh --host <MODERATOR_HOST> --port 5555 -R 3,4,5
+
+# On each player machine, once the moderator is waiting:
+sudo /opt/werewolf/run_players.sh --host <MODERATOR_HOST> --port 5555 player3 player4
+# or play a seat yourself:  sudo -u player3 python3 /opt/werewolf/player.py player3 --host <MODERATOR_HOST>
 ```
 
-The seat name must match the Linux user. With `--peercred`, the moderator rejects any process whose kernel-reported uid doesn't match its seat.
+`deploy_remote.sh` needs an account on the target that can `sudo`; it creates the seat users there, installs `/opt/werewolf`, and puts each key in `/etc/werewolf/tls/<seat>/` (owner `<seat>`, mode 0600). It never copies `ca.key` or other seats' keys, and prints `commslib.py` checksums for both ends; re-run it after every code change. `run_game.sh` refuses to start if `--host` isn't in the moderator's certificate.
 
-| `moderator.py` flag | Default | Meaning |
-|---|---|---|
-| `players...` | (required) | Seat names, 4–6 of them |
-| `--dir` | `/run/werewolf` | Socket directory |
-| `--port N` | off (UNIX) | Listen on TCP + TLS port N instead of UNIX sockets (`0` = any free port, printed at startup). Can't be combined with `--peercred` or `--local`. |
-| `--host` | `127.0.0.1` | TCP address to listen on. Use `0.0.0.0` to accept players from other machines. |
-| `--tls DIR` | `/etc/werewolf/tls` | Certificates from `make_certs.sh` (the moderator uses `DIR/ca.crt` and `DIR/moderator/`) |
-| `--peercred` | off | Enforce the SO_PEERCRED uid check (seat names must be Linux users) |
-| `--seed N` | random | Reproducible role deal |
-| `--join-timeout` | 120 | Seconds to wait for all seats to connect |
-| `--night-timeout` | 45 | Seconds for all night actions; anyone silent gets a no-op |
-| `--discussion` | 60 | Seconds of day chat before voting |
-| `--vote-timeout` | 30 | Seconds to vote; anyone silent abstains |
-| `--max-rounds` | 20 | The game is a draw after this many night+day rounds |
-| `--heartbeat` | 2 | Seconds between the moderator's heartbeats |
-| `--heartbeat-misses` | 3 | Treat a player's link as dead after this many of *its* heartbeat intervals of silence |
-| `--resume-timeout` | 120 | Seconds to hold a disconnected player's seat (and keep its messages) for it to reconnect. `0` = no reconnecting, as in Project 1. |
-| `--linger` | 30 | After the game, wait up to this long until every player has acknowledged the result: a player reconnecting at that moment, or a slow lossy link, still gets `GAME_OVER` |
-| `--local` | off | Development only: create the seat directories yourself (see below) |
-
-| `player.py` flag | Meaning |
-|---|---|
-| `name` | Your seat, e.g. `player1` |
-| `--dir` | Socket directory (default `/run/werewolf`) |
-| `--port N` | Connect to the moderator over TCP + TLS instead, as seat `name` (your certificate must be for `name`) |
-| `--host` | Moderator's address (default `127.0.0.1`). It must be one of the names or IPs in the moderator's certificate (`make_certs.sh -s`). |
-| `--tls DIR` | Certificates from `make_certs.sh`: `DIR/ca.crt` and `DIR/<name>/` (default `/etc/werewolf/tls`) |
-| `--bot` / `--bot silent` | No keyboard: play randomly, or never respond |
-| `--log FILE` | Append every received message to FILE as JSON lines |
-| `--wait` | Seconds to keep retrying the connection (default 30) |
-| `--heartbeat` / `--heartbeat-misses` | Same as the moderator's, from the player's side: how often to send, and how many of the moderator's intervals to wait before giving up on it (defaults 2 and 3) |
-| `--bot-think SECONDS` | Bots wait this much longer before every action (default 0) |
-
-### Trying it without creating users (development mode)
-
-This runs every process as **your own user**, so it does **not** demonstrate the one-user-per-player isolation. It's useful for a quick look:
+Open the port on the moderator's machine only (players connect out). *Not verified (no firewalld in the test containers):*
 
 ```bash
-python3 moderator.py p1 p2 p3 p4 p5 --dir /tmp/ww --local
-python3 player.py p1 --dir /tmp/ww                       # in another terminal (you)
-python3 player.py p2 --dir /tmp/ww --bot &               # bots for the other seats
-python3 player.py p3 --dir /tmp/ww --bot &
-python3 player.py p4 --dir /tmp/ww --bot &
-python3 player.py p5 --dir /tmp/ww --bot &
+sudo firewall-cmd --get-active-zones                         # which zone your interface is in
+sudo firewall-cmd --add-port=5555/tcp                        # until reboot; add --zone=<ZONE> if needed
+sudo firewall-cmd --permanent --add-port=5555/tcp && sudo firewall-cmd --reload   # permanent
 ```
 
-The same over TCP + TLS: make a throwaway set of certificates, then give every process `--port` and `--tls` instead of `--dir`.
-
-```bash
-./make_certs.sh -o /tmp/pki p1 p2 p3 p4 p5               # not root: nothing is chowned
-python3 moderator.py p1 p2 p3 p4 p5 --port 5555 --tls /tmp/pki
-python3 player.py p1 --port 5555 --tls /tmp/pki          # in another terminal (you)
-for p in p2 p3 p4 p5; do python3 player.py $p --port 5555 --tls /tmp/pki --bot & done
-```
-
-For real users, `sudo ./make_certs.sh` (after `setup_users.sh`) writes to `/etc/werewolf/tls`, the default `--tls`, and gives each key to its own Linux user:
-
-```bash
-sudo ./make_certs.sh                                       # player1..player5; sudo N_PLAYERS=6 for 6
-sudo -u modbot  python3 /opt/werewolf/moderator.py player1 player2 player3 player4 player5 --port 5555
-sudo -u player1 python3 /opt/werewolf/player.py player1 --port 5555
-```
-
-`make_certs.sh` options: `-o DIR` (output), `-s SAN` (repeatable; the moderator's names and IPs, which replace the default `DNS:localhost`, `IP:127.0.0.1`, `DNS:$(hostname)`), `-f` (new CA), `-U` (don't chown). Re-running keeps the CA. The layout is in [DISTRIBUTED.md](DISTRIBUTED.md#certificates-make_certssh).
-
-### Playing across machines
-
-Each player can run on a different computer, still as its own Linux user, talking to the moderator over TCP with mutual TLS. Every machine needs Python 3.11+, `sudo`, and `ssh` access from the moderator's machine. Below, the moderator's machine is `192.168.1.10` (name `mod.lan`), and seats 3–5 play on two other machines.
-
-**On the moderator's machine:**
-
-```bash
-sudo ./setup_users.sh                               # users, /opt/werewolf (as before)
-# Certificates. -s lists EVERY name/IP players will use to reach this machine;
-# players check the address they dial against this list.
-sudo ./make_certs.sh -s DNS:localhost -s IP:127.0.0.1 -s IP:192.168.1.10 -s DNS:mod.lan
-
-# Install the code + each remote seat's certificate on its machine (ssh/scp; asks
-# for your sudo password there). Only those seats' keys are sent, never the CA key.
-./deploy_remote.sh alice@192.168.1.21 player3 player4
-./deploy_remote.sh bob@192.168.1.22 player5
-
-# Start the game. --open-firewall opens the port for this game only (see below).
-sudo ./run_game.sh --host 192.168.1.10 --port 5555 -R 3,4,5 --open-firewall
-```
-
-**On each player machine**, once the moderator is waiting:
-
-```bash
-sudo /opt/werewolf/run_players.sh --host 192.168.1.10 --port 5555 player3 player4          # bots
-sudo /opt/werewolf/run_players.sh --host 192.168.1.10 --port 5555 -H player3 player3 player4   # player3 human
-```
-
-A human seat is played with the printed command: `sudo -u player3 python3 /opt/werewolf/player.py player3 --host 192.168.1.10 --port 5555`.
-
-| `deploy_remote.sh` option | Meaning |
-|---|---|
-| `USER@HOST SEAT...` | Where to install, and which seats' certificates to send (`moderator` for a separate moderator host) |
-| `-p PORT` | ssh port (default 22) |
-| `-i FILE` | ssh identity file |
-| `-t DIR` | local certificate directory (default `/etc/werewolf/tls`) |
-
-On the target, `deploy_remote.sh`:
-- creates the seats' Linux users (and the `werewolf` group);
-- installs the game code to `/opt/werewolf` (`root:werewolf 0750`);
-- installs `/etc/werewolf/tls/ca.crt` and each seat's `cert.pem`/`key.pem` in `/etc/werewolf/tls/<seat>/`, owned by that seat, directory `0700`, key `0600`.
-
-It then prints the remote `commslib.py` checksum next to the local one. **Re-run it after every code change**: machines with different `commslib.py` versions don't speak the same protocol.
-
-`run_players.sh` options: `--host`, `--port` (both required), `--tls DIR`, `-H` / `-S` seat lists (by name), and `-- ARGS` for extra `player.py` flags.
-
-#### Opening the port on Fedora (firewalld)
-
-The moderator's machine must accept TCP connections on the game port. Players only make outgoing connections, so they need no rule. Check which zone the network interface is in first:
-
-```bash
-sudo firewall-cmd --get-active-zones                 # e.g. "FedoraWorkstation  interfaces: enp3s0"
-```
-
-| Goal | Command |
-|---|---|
-| Open for now (until reboot or `--reload`) | `sudo firewall-cmd --add-port=5555/tcp` |
-| Open permanently | `sudo firewall-cmd --permanent --add-port=5555/tcp && sudo firewall-cmd --reload` |
-| Only from your LAN (recommended) | `sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="192.168.1.0/24" port port="5555" protocol="tcp" accept' && sudo firewall-cmd --reload` |
-| A non-default zone | add `--zone=<zone>` to each command above |
-| See what's open | `sudo firewall-cmd --list-ports; sudo firewall-cmd --list-rich-rules` |
-| Close it again | `sudo firewall-cmd --permanent --remove-port=5555/tcp && sudo firewall-cmd --reload` (and `--remove-rich-rule='...'` for the LAN rule) |
-
-`run_game.sh --open-firewall` does the "open for now" step and closes the port again when the game ends. It never adds a permanent rule.
-
-- **SELinux:** no port labelling (`semanage port`) is needed. The game's processes are started with `sudo -u` from a shell and run as `unconfined_t`, which may bind any unprivileged port.
-- **Why mutual TLS is enough:** with the port open, anyone on the network can *connect*, but without a certificate signed by the game's CA they're refused during the TLS handshake. See [DISTRIBUTED.md](DISTRIBUTED.md).
-
-### Rules
-
-| | |
-|---|---|
-| **Roles** | 2 Werewolves, 1 Seer, 1 Doctor; the rest are Villagers. Each player sees only their own role. The two wolves know each other. |
-| **Night** | The wolves agree on a victim; they can whisper to each other. The Seer learns whether one player is a werewolf. The Doctor protects one player (themselves allowed), **never the same player two nights in a row**. Anyone who doesn't act before the timer ends takes no action. |
-| **Dawn** | The victim dies unless the Doctor protected them. Roles are *not* revealed. |
-| **Day** | Living players chat until the discussion timer ends, then vote. **The single most-voted player is eliminated; a tie (or no votes) eliminates nobody.** Votes are public. |
-| **Dead players** | Become spectators: they see announcements and vote results, but can't chat, vote or act. |
-| **Winning** | The **village** wins when no wolves are left. The **wolves** win when living wolves are at least as many as everyone else. At the end, every role is revealed. |
-
-### Commands (in a player's terminal)
-
-| Command | When | Effect |
-|---|---|---|
-| `/kill <name or number>` | night, wolves | Vote for the pack's victim (you can change it until both wolves agree) |
-| `/peek <name or number>` | night, Seer | Learn whether that player is a werewolf |
-| `/heal <name or number>` | night, Doctor | Protect that player tonight |
-| `/w <message>` | night, wolves | Whisper to the other wolf |
-| *(any text without `/`)* | day | Chat with the other living players |
-| `/vote <name or number>` / `/vote none` | voting | Vote to eliminate, or abstain |
-| `/role` | any time | Show your role again |
-| `/help` | any time | List the commands |
-| `/quit` | any time | Leave the game |
-
-Messages from the moderator appear as soon as they arrive, even while you're typing. Your half-typed line is redrawn underneath them.
-
----
-
-## Communications library API (`commslib.py`)
-
-**File:** `commslib.py`, in the project's top-level directory; installed to `/opt/werewolf/commslib.py`.
-**Dependencies:** the Python standard library only (`asyncio`, `socket`, `struct`, `json`, `os`, `pwd`).
-**Used by:** `moderator.py` (the `Server` class) and `player.py` (the `Client` class). No other game file opens a socket.
-
-### Transport
-
-| | |
-|---|---|
-| Primitive | UNIX domain stream sockets (`AF_UNIX`, `SOCK_STREAM`) via `asyncio.start_unix_server` / `asyncio.open_unix_connection`, **or** TCP + mutual TLS 1.3 (`ssl`) via `asyncio.start_server` + `StreamWriter.start_tls` / `asyncio.open_connection(ssl=...)` when a `port` is given |
-| Topology | Star. UNIX: the moderator owns **one listening socket per player seat**; each player connects only to its own. TCP: one listening port; a connection's seat is the CN of its verified client certificate, and its `HELLO` frame must name that same seat (handshake in [DISTRIBUTED.md](DISTRIBUTED.md)) |
-| Socket path | `<base_dir>/<player_id>/sock`, e.g. `/run/werewolf/player1/sock`; built by `player_socket_path()` |
-| Message | A Python `dict`, serialized as JSON |
-| Concurrency model | Every call except `connected()` and `player_socket_path()` is a **coroutine** (`await` it inside an asyncio event loop) |
-
-### Wire format (framing)
-
-Each message on the wire is one frame:
-
-```
-+---------------------------+-------------------------------------+
-| 4 bytes: unsigned length  |  <length> bytes: UTF-8 JSON object  |
-| N, big-endian (">I")      |                                     |
-+---------------------------+-------------------------------------+
-```
-
-- Stream sockets don't preserve message boundaries; the length prefix is what lets the receiver know where each message ends.
-- The receiver reads exactly 4 bytes, then exactly N bytes.
-- Frames larger than `MAX_MESSAGE_BYTES` (1 MiB) are refused.
-- A frame whose body isn't UTF-8 JSON, or is JSON but not an object (e.g. `[1, 2]`), is a `ProtocolError`. The receiver hangs up on that peer.
-
-### Module-level names
-
-| Name | Description |
-|---|---|
-| `player_socket_path(player_id: str, base_dir: str = "/run/werewolf") -> str` | Returns `<base_dir>/<player_id>/sock`. Both sides use it, so they always agree on the path. |
-| `DEFAULT_SOCKET_DIR = "/run/werewolf"` | Default `base_dir` |
-| `DEFAULT_TCP_HOST = "127.0.0.1"` | Default TCP `host` for both sides |
-| `DEFAULT_TLS_DIR = "/etc/werewolf/tls"`, `MODERATOR_ID = "moderator"` | Default `tls_dir`; the moderator's identity in it |
-| `tls_paths(identity, tls_dir=DEFAULT_TLS_DIR) -> (ca, cert, key)` | `<tls_dir>/ca.crt`, `<tls_dir>/<identity>/cert.pem`, `<tls_dir>/<identity>/key.pem` (the layout `make_certs.sh` creates) |
-| `HELLO_TIMEOUT = 5.0`, `CONNECT_TIMEOUT = 5.0` | TCP handshake and connect limits |
-| `KEEPALIVE_IDLE/INTERVAL/COUNT = 10/5/3`, `TCP_USER_TIMEOUT_MS = 30000` | TCP keepalive settings applied to every TCP link (why: [DISTRIBUTED.md](DISTRIBUTED.md#socket-options-tcp-both-ends)) |
-| `MAX_MESSAGE_BYTES = 1048576` | Largest accepted frame body |
-| `class ConnectionClosed(ConnectionError)` | The link is gone: the other end hung up, the connection reset, a send timed out, or the peer broke the protocol. `str(e)` says which. |
-| `class ProtocolError(ConnectionClosed)` | The peer sent an oversized or malformed frame |
-| `class SeatRefused(ConnectionClosed)` | TCP: `Client.connect()` was turned away, by an `error` reply (`str(e)` is the moderator's reason) or by the moderator hanging up during the handshake (it rejected our certificate; its log says why) |
-| `DEFAULT_SEND_TIMEOUT = 5.0` | Default for `Server(send_timeout=...)` |
-| `CLOSE_TIMEOUT = 2.0` | How long `close()` waits for buffered data to flush before aborting |
-| `DEFAULT_HEARTBEAT_INTERVAL = 2.0`, `DEFAULT_HEARTBEAT_MISSES = 3`, `MAX_HEARTBEAT_INTERVAL = 60.0` | Heartbeat defaults, and the largest interval a peer may announce |
-| `DEFAULT_RESUME_TIMEOUT = 120.0`, `MAX_OUTBOX = 1000` | How long an away player's seat is held; how many unacknowledged messages a session may hold |
-| `DATA = "DATA"`, `BYE = "BYE"` | Reserved types: the envelope every game message travels in, and "this session is over on purpose" |
-| `HEARTBEAT = "HEARTBEAT"` | Reserved message type: commslib sends and consumes these itself, and they're never delivered to the game |
-
-### `class Server`: the moderator's side
-
-Create one with `server = Server(send_timeout=5.0, heartbeat_interval=2.0, heartbeat_misses=3, resume_timeout=120.0)`.
-
-- **Heartbeats:** every live link sends a heartbeat every `heartbeat_interval` seconds. It is declared dead (reason `no heartbeat ...`) if nothing arrives on it for `heartbeat_misses` of the intervals *it* announced.
-- **Sessions:** each seat has a *session* that outlives its links. When a link dies the player is *away* (`_away`): its seat is held and messages to it are kept, for `resume_timeout` seconds, while the player reconnects with its session token. It then gets everything it missed, in order, exactly once (`_resumed`). Only if it doesn't come back, quits (`BYE`) or breaks the protocol does the session end (`_disconnected`). The protocol is in [DISTRIBUTED.md](DISTRIBUTED.md#resume).
-- **Errors:** `ValueError` if the interval isn't in (0, 60], misses < 1, or `resume_timeout` < 0.
-
-Methods:
-
-| Method | Description |
-|---|---|
-| `await start(player_ids, base_dir="/run/werewolf", check_peer_uid=False, *, host=None, port=None, tls_dir="/etc/werewolf/tls")` | **With `port`:** one TCP + mutual-TLS listener on `host:port` (`host` defaults to `127.0.0.1`; `port=0` picks a free port, readable afterwards as `server.port`), using `tls_dir`'s CA and moderator certificate. It raises `OSError` if those can't be loaded. A connection is seated by the CN of its client certificate; certificates not signed by the CA, for no seat, or for a different seat than the `HELLO` names are refused. `base_dir` is ignored, and `check_peer_uid=True` raises `ValueError` (SO_PEERCRED is UNIX-only). **Without `port`:** opens a listening socket at `<base_dir>/<id>/sock` for each id and sets it to mode `0660`. A stale socket file left over from a crash is removed first. **The seat directories must already exist** (`setup_users.sh` creates them); raises `FileNotFoundError` if one is missing. With `check_peer_uid=True`, each `player_id` must be a Linux username (`KeyError` otherwise), and connections whose SO_PEERCRED uid doesn't match are rejected. |
-| `await wait_for_players(timeout=None)` | Returns once every seat has a session. Raises `TimeoutError` if `timeout` seconds pass first. |
-| `connected() -> list[str]` | Seats still in the game: live, *or away and resumable* (messages to them are kept and replayed). Not a coroutine. |
-| `live() -> list[str]` | Seats with a working link right now |
-| `lock_roster()` | Call when the game starts. From then on, a seat whose session has ended can't be taken by a fresh session, because the fresh one would lack what the old one was sent (its role). Before it, a player who left the lobby can join again. |
-| `await send_to(player_id, msg: dict)` | **1:1**: send to one player. The message is numbered and kept until the player acknowledges it, so it isn't lost if the link breaks. While the player is away it waits and is replayed on return. If the player doesn't make room for it within `send_timeout` seconds (a stopped or wedged process), the link is dropped and the player becomes away; the message is still kept. Raises `KeyError` if the seat has no session (never joined, or ended), and `ConnectionClosed` if an away player has fallen `MAX_OUTBOX` messages behind, in which case its session is ended. |
-| `await multicast(player_ids, msg: dict) -> list[str]` | **Multicast**: send the same message to a subset of players, **concurrently**. A failed send to one player doesn't stop the others. Returns the ids that could not be reached (no session). |
-| `await broadcast(msg: dict) -> list[str]` | **Broadcast**: `multicast` to every player still in the game (`connected()`). Returns the unreachable ids. |
-| `await recv_any(timeout=None) -> (player_id, msg)` | Next message from **any** player, in arrival order. Raises `TimeoutError` if nothing arrives within `timeout` seconds. |
-| `await close()` | Stops accepting, closes every connection, waits (2s limit) for the per-connection tasks to finish, and deletes the socket files. Messages already sent are still delivered before the connection closes. |
-
-**Events the Server puts in the `recv_any` stream itself.** They are never sent over the wire, and their `type` starts with `_`:
-
-| `msg["type"]` | Meaning |
-|---|---|
-| `"_connected"` | That player has taken its seat (a new session) |
-| `"_away"` | Its link broke (`msg["reason"]`). The seat is held for `msg["resume_timeout"]` seconds; it is still in `connected()`, and messages to it are kept. |
-| `"_resumed"` | It reconnected after `msg["away"]` seconds; `msg["replayed"]` messages were resent to it |
-| `"_disconnected"` | Its session is over for good; `msg["reason"]` says why (`left the game`, `did not come back within ...`, a protocol error, ...) |
-| `"_rejected"` | A connection was refused; `msg["reason"]` says why: SO_PEERCRED mismatch (`msg["uid"]` holds the uid), seat already taken, a wrong or expired session token (all under that seat), or (TCP, under player id `None`) a failed TLS handshake (no certificate, wrong CA, not TLS) or a certificate for no seat / for a different seat than the `HELLO`. |
-
-**What the server sends on its own** (the game never needs to): `WELCOME`, heartbeats, acks and replays; `BYE` at `close()`; and `{"type": "error", "text": ...}` to a connection it refuses, before closing it.
-
-**How it works:** each accepted connection gets its own reader task. All the reader tasks put complete messages into one shared `asyncio.Queue`, and `recv_any(timeout)` is `asyncio.wait_for(queue.get(), timeout)`. The moderator therefore never blocks on any single player.
-
-### `class Client`: a player's side
-
-Create one with `client = Client(heartbeat_interval=2.0, heartbeat_misses=3)`.
-
-**Reconnecting:** if the link breaks (anything except `BYE` or a protocol error), the client reconnects **by itself** with its session token, for as long as the moderator's `resume_timeout` allows. Both sides then replay what the other missed. Meanwhile `recv()` waits and `send()` queues. `recv()` also returns two events, which the game can print:
-- `{"type": "_reconnecting", "reason", "resume_timeout"}`;
-- `{"type": "_resumed", "away", "replaying"}`, after which the missed messages follow.
-
-`ConnectionClosed` comes only once the session is over.
-
-Methods:
-
-| Method | Description |
-|---|---|
-| `await connect(socket_path=None, retry_seconds=10.0, *, host=None, port=None, player_id=None, tls_dir="/etc/werewolf/tls")` | Connect to the moderator: over UNIX at `socket_path`, or, with `port`, over TCP + TLS to `host:port` as `player_id`, presenting `tls_dir/<player_id>/` and trusting only `tls_dir/ca.crt`. Retries every 0.2s while nothing is listening yet (the moderator may still be starting), for up to `retry_seconds`. These are raised immediately: `PermissionError` (UNIX: wrong user for this seat; TCP: can't read our key), `SeatRefused` (TCP: the moderator refused us), `ssl.SSLCertVerificationError` (TCP: **we** refused the moderator: wrong CA, or `host` not in its certificate). |
-| `await send(msg: dict)` | Send one message to the moderator (numbered and kept until acknowledged; queued while reconnecting). Raises `ConnectionClosed` only once the session is over. |
-| `await recv(timeout=None) -> dict` | Next message from the moderator, or a `_reconnecting` / `_resumed` event. Raises `TimeoutError` if `timeout` expires, or `ConnectionClosed` once the session is over: `BYE` from the moderator, a protocol error, a refused or timed-out resume. It never hangs on a dead link. |
-| `await close()` | Leave for good: send `BYE` (so the moderator ends the session at once instead of holding the seat), then stop the background task |
-
-The Client also reads in a background task that feeds a queue. As a result, a `recv(timeout)` that times out can never cut a frame in half.
-
-### `class Connection`: one framed link (used inside `Server` and `Client`)
-
-| Method | Description |
-|---|---|
-| `write(msg: dict)` | Frame one message and hand it to the transport in a single synchronous call. No other task can run in the middle, so frames never interleave and no lock is needed. Raises `TypeError` if `msg` isn't a dict, `ValueError` if it's over 1 MiB, and `ConnectionClosed` if the link is already closing. |
-| `await drain()` | Wait until the OS has room for what was written |
-| `await send(msg: dict)` | `write()` then `drain()` |
-| `await recv() -> dict` | The next frame, whatever its type. Every frame updates `last_heard`; a `HEARTBEAT`'s interval is checked here. Raises `ConnectionClosed` on EOF or any socket error, and `ProtocolError` on an oversized or malformed frame or a bad heartbeat interval. |
-| `abort(reason=None)` | Drop the link immediately, discarding unsent data. `reason` becomes the message of the `ConnectionClosed` that the reader then gets. |
-| `await heartbeat(interval, misses, ack)` | Run as a task for the life of the link: send `HEARTBEAT` (carrying `ack()`) every `interval` s, and `abort()` if nothing arrives for `misses ×` the peer's interval. `Server` and `Client` start it for you. |
-| `await close()` | Close the link, waiting up to `CLOSE_TIMEOUT` for unsent data to flush, then aborting |
-
-### Minimal example
-
-```python
-# server side (moderator)
-import asyncio
-from commslib import Server
-
-async def main():
-    server = Server()
-    await server.start(["player1", "player2"])            # /run/werewolf/player{1,2}/sock
-    await server.wait_for_players(timeout=60)
-    await server.send_to("player1", {"type": "hello"})                    # 1:1
-    await server.multicast(["player1", "player2"], {"type": "group"})     # multicast
-    await server.broadcast({"type": "everyone"})                          # broadcast
-    while True:                                                           # from anyone
-        pid, msg = await server.recv_any(timeout=10)
-        if not msg["type"].startswith("_"):   # skip the server's own _connected/... events
-            break
-    print(pid, msg)                                                       # player1 {'type': 'reply'}
-    await server.close()
-
-asyncio.run(main())
-```
-
-```python
-# client side (player)
-import asyncio
-from commslib import Client, player_socket_path
-
-async def main():
-    client = Client()
-    await client.connect(player_socket_path("player1"))
-    print(await client.recv())
-    await client.send({"type": "reply"})
-    await client.close()
-
-asyncio.run(main())
-```
-
-The game's own message types (`ROLE_ASSIGN`, `NIGHT_PROMPT`, `CHAT`, `VOTE_TALLY`, `GAME_OVER`, …) are ordinary dicts sent through this API. `ARCHITECTURE.md` §4 lists each one with its delivery (1:1, multicast or broadcast) and why.
-
----
-
-## Files
-
-| File | What it is |
-|---|---|
-| **`commslib.py`** | **The communications library**: the only file that uses sockets (see the API above) |
-| `moderator.py` | The moderator / game server. Owns all game state, runs the phases (night, day, vote) with timeouts, decides who receives each message, checks for a winner. Run as `modbot`. |
-| `player.py` | The player client. Shows messages from the moderator, reads your commands, and reads the keyboard and the socket at the same time. `--bot` makes it play automatically. Run as `playerN`. |
-| `roles.py` | The game rules: role definitions, legal night targets, resolving the night, vote counting, win conditions. No I/O. |
-| `setup_users.sh` | **Setup / install.** Creates the users and groups, copies the code to `/opt/werewolf`, builds `/run/werewolf` with per-player permissions. Run with sudo. |
-| `run_game.sh` | Starts a game as real users: the moderator, the bots, and printed commands for the human seats. Run with sudo. |
-| `teardown_users.sh` | Uninstall: removes the users, groups, `/opt/werewolf`, `/run/werewolf` and `/etc/werewolf`. Run with sudo. |
-| `make_certs.sh` | Creates the game CA, the moderator's certificate and one per player (keys 0600, owned by their Linux users when run as root) |
-| `deploy_remote.sh` | Installs the code and given seats' certificates on another machine over ssh/scp (see [Playing across machines](#playing-across-machines)) |
-| `run_players.sh` | Starts one machine's seats for a game whose moderator runs elsewhere (installed on player machines by `deploy_remote.sh`) |
-| `test_deploy.sh`, `cluster.sh` | Automated multi-host test: three podman containers act as three machines; deploys over real ssh and plays a game across them |
-| `test_faults.sh` | Automated fault injection on the same containers: `tc netem` latency + loss, and `iptables DROP` partitions mid-night and mid-vote; checks the timeouts fire, players resume, and the game finishes |
-| `test_tls.sh` | Checks who gets a seat over TLS (valid, missing, foreign or stolen certificates; impostor moderators); with sudo, also the key ownership |
-| `tls_server.py`, `tls_probe.py` | Helpers used by `test_tls.sh` |
-| `test_permissions.sh` | Checks that each player can reach only its own socket, and that SO_PEERCRED rejects impostors. Run with sudo after setup. |
-| `perm_server.py`, `perm_probe.py` | Helpers used by `test_permissions.sh` |
-| `ping_server.py`, `ping_client.py` | Stand-alone commslib demo: 1:1, multicast, broadcast, a receive timeout, and a 300 KB message |
-| `test_no_role_leak.py` | Automated: plays full games and checks that villagers never receive anyone else's role |
-| `test_night.py` | Automated: night phase, including the timeout for silent players and the Doctor rule |
-| `test_day.py` | Automated: chat relay, voting, ties, spectators |
-| `test_game.py` | Automated: whole games, win conditions, clean shutdown on signals; a frozen (`SIGSTOP`) player marked away, then resuming with exactly the messages everyone else got; one frozen past the resume window, dropped for good |
-| `test_commslib.py` | Automated: commslib failure paths (malformed frames, a stuck reader, a dead link) on both transports, the TCP/TLS handshake and socket options, heartbeats (idle link kept, silent peer dropped, black-holed link noticed by both ends), and sessions (replay after a partition in both directions, takeover, duplicate suppression, token refusals, expiry, `BYE`, lobby rejoin, outbox limit) |
-| `testnet.py` | Test helper: `WW_TRANSPORT=tcp` makes the process-launching tests use TCP |
-| `DISTRIBUTED.md` | Project 2 protocol: transports, certificates, handshake, socket options, failure model |
-| `ARCHITECTURE.md` | Design document: diagram, framing, permissions, message table, concurrency |
-| `README.md` | This file |
-| `CLAUDE.md` | Development notes, used by the AI assistant that helped write the code |
-
----
+`sudo ./run_game.sh ... --open-firewall` opens the port for one game and closes it afterwards (*not verified*).
+
+## Security design
+
+- **TLS 1.3 only, mutual.** Both sides trust only the game's CA (`ca.crt`), present their own certificate, and require the other's. The player also checks the moderator's certificate against the address it dialled (SAN), so an impostor moderator is refused.
+- **Identity comes from the verified certificate**, never from a message. The seat is the certificate's CN; the `HELLO` naming a different seat is refused. Each key is readable only by its own Linux user, so only that user can take the seat.
+- **Session tokens.** A seat's session gets a random 128-bit token (`secrets`), compared in constant time; only that token resumes it after a network failure.
+- **Before authentication:** the TLS handshake and the `HELLO` each get 5 s; frames over 1 MiB, malformed JSON and protocol violations close the connection. There is no limit on the number of concurrent unauthenticated connections.
+- There is no plaintext mode and no flag or variable that turns TLS or verification off. Threat model, failure model and protocol details: `DISTRIBUTED.md` ("Handshake", "Failure model"). There is no separate `SECURITY.md`.
 
 ## Testing
 
-Run these from the project directory. Each step builds on the one before, so a failure tells you which layer broke.
+| Command | Proves | Needs | Expect |
+|---|---|---|---|
+| `python3 test_commslib.py` | framing; malformed / oversized frames rejected; handshake refusals; heartbeats; replay after partitions with no duplicates | — | `all commslib tests passed` |
+| `python3 test_no_role_leak.py` | villagers never receive anyone's role before `GAME_OVER` (with a self-test of the checker) | — | `PASS: 12 villager logs, no role leaks` |
+| `python3 test_night.py` | night timeouts, early finish, Doctor no-repeat | — | `all night tests passed` |
+| `python3 test_day.py` | votes, ties, abstention, spectators, chat relay | — | `all day tests passed` |
+| `python3 test_game.py` | whole games; signals; a frozen player resumes; a player gone too long is dropped | — | `all game tests passed` |
+| `./test_tls.sh` | who gets a seat: missing, foreign, stolen or wrong-seat certificates refused; impostor moderators refused | — | `14 passed, 0 failed` |
+| `sudo ./test_tls.sh` | the same, plus key ownership as the real users | root, after `setup_users.sh` | `21 passed, 0 failed` |
+| `./test_deploy.sh` | `deploy_remote.sh` over real ssh/scp/sudo to other "hosts"; a game across three hosts | podman | `19 passed, 0 failed` |
+| `./test_faults.sh` | `tc netem` latency + loss; `iptables DROP` partitions mid-night and mid-vote: timeouts fire, players resume, game finishes | podman | `18 passed, 0 failed` |
 
-### 0. Automated tests (no sudo, about 1 minute)
-
-These run every process as your own user, using temporary socket directories.
-
-```bash
-python3 test_commslib.py && python3 test_no_role_leak.py && python3 test_night.py && python3 test_day.py && python3 test_game.py
-```
-
-All five should end with `PASS` / `all ... tests passed`.
-
-The same four game suites over localhost TCP + TLS, with a throwaway PKI made per run (`test_commslib.py` already covers both):
-
-```bash
-export WW_TRANSPORT=tcp
-python3 test_no_role_leak.py && python3 test_night.py && python3 test_day.py && python3 test_game.py
-unset WW_TRANSPORT
-```
-
-The commslib demo on its own (one slow client shows the timeout):
-
-```bash
-python3 ping_server.py & python3 ping_client.py p1 & python3 ping_client.py p2 & python3 ping_client.py p3 --delay 3 & wait
-```
-
-### 0b. Multi-host test (needs podman, no sudo, a few minutes the first time)
-
-Three containers stand in for three machines, each with its own network address, users and sshd. The test:
-1. runs `setup_users.sh` and `make_certs.sh` on the "moderator machine";
-2. deploys to the other two with `deploy_remote.sh` (real ssh, scp and sudo);
-3. checks what landed there: owners, modes, and no stray keys;
-4. checks `run_game.sh`'s refusals;
-5. plays one game across all three.
-
-```bash
-./test_deploy.sh               # expect: 19 passed, 0 failed
-KEEP=1 ./test_deploy.sh        # leave the containers running, to look around:
-podman exec -it ww-pa bash     #   e.g. ls -l /etc/werewolf/tls; podman rm -f ww-mod ww-pa ww-pb when done
-```
-
-The first run builds a Fedora image (`localhost/werewolf-host`) with dnf, so it needs network access.
-
-### 0c. Fault injection (needs podman, no sudo, about 4 minutes)
-
-Three whole games on the same three containers, each with one injected fault:
-
-| Game | Fault |
-|---|---|
-| A | `tc netem`: 150 ms ± 50 ms delay and 10 % loss on every host |
-| B | `iptables DROP` between one player host and the moderator from the moment night 1 starts; the seer is on that host |
-| C | the same from the moment voting opens |
-
-For B and C it checks that:
-- the moderator notices within the heartbeat bound;
-- the night or the vote **times out**, with a no-op or abstention for the cut-off seats;
-- the players **resume** once the partition is lifted;
-- the game **finishes**, with every player holding exactly the same broadcasts.
-
-```bash
-./test_faults.sh               # expect: 18 passed, 0 failed
-```
-
-The faults are applied inside the containers' own network namespaces, so your machine's network is untouched. Details and measured timings are in [DISTRIBUTED.md](DISTRIBUTED.md#fault-injection-tests-test_faultssh).
-
-### 1. Set up users and confirm isolation
-
-```bash
-sudo ./setup_users.sh          # creates the users, copies the code to /opt/werewolf, builds /run/werewolf
-sudo ./test_permissions.sh     # expect: 8 passed, 0 failed
-```
-
-If `test_permissions.sh` fails, fix that first (see [Troubleshooting](#troubleshooting)).
-
-The TLS rules (no sudo needed for the protocol checks; with sudo it also checks that each key belongs to its own user and that the other users can't read it):
-
-```bash
-./test_tls.sh                  # expect: 14 passed, 0 failed
-sudo ./test_tls.sh             # expect: 21 passed, 0 failed (needs setup_users.sh)
-```
-
-### 2. Bot game as real Linux users
-
-```bash
-sudo ./run_game.sh -- --night-timeout 10 --discussion 5 --vote-timeout 10
-```
-
-**What to check:**
-
-- The moderator's output shows nights, chat, votes, then `GAME OVER: ...` and `all sockets closed`.
-- The summary shows every player exiting with status `0` and `socket files left behind: none`.
-- **See the game from one player's side:** `cat /tmp/werewolf-run.*/player1.out`
-- **Each process runs as its own user** (run this in another terminal during a game): `ps -o user,pid,cmd -C python3`
-- **Timeout path:** add `-S 4` to make player4 silent. Each night then waits out its timer, and player4 is told "Time's up".
-
-### 3. Manual game: two humans plus three bots
-
-```bash
-sudo ./run_game.sh -H 1,2 -- --join-timeout 300
-```
-
-Then open two more terminals and run the commands it prints:
-
-```bash
-sudo -u player1 python3 /opt/werewolf/player.py player1
-sudo -u player2 python3 /opt/werewolf/player.py player2
-```
-
-**Things to try:**
-
-| Try this | What should happen |
-|---|---|
-| Start typing, then wait for a message to arrive | Your half-typed line is redrawn under the message |
-| Don't act during a night | After the night timer you get "Time's up"; the game continues |
-| Use the wrong command or an invalid target | You get a clear error; nothing breaks |
-| Chat at night, or vote during the discussion | Rejected with an explanation |
-| Be killed or voted out | You switch to spectating: you still see announcements, but not the chat |
-| End of the game | Roles revealed, the player exits, and your terminal echoes normally again |
-
-### 4. Breakage tests (optional)
-
-- **Kill a player mid-game:** the moderator logs `player3 disconnected`, and the game continues.
-
-  ```bash
-  sudo pkill -TERM -u player3 -f player.py
-  ```
-- **Kill the moderator mid-game:** press Ctrl-C in its terminal. Every player should get "Game over, no winner: the moderator was shut down." and exit.
-- **Connect to someone else's seat:**
-
-  ```bash
-  sudo -u player2 python3 /opt/werewolf/player.py player1
-  ```
-
-  This fails with `Permission denied`.
-
----
+The tests without "root" run as your own user over localhost. The two podman tests start three containers as separate hosts (the first run builds a Fedora image, so it needs network access), and no real second machine is needed. There is no `test_fuzz.py`; malformed-input handling is covered in `test_commslib.py`.
 
 ## Troubleshooting
 
-| Symptom | Fix |
-|---|---|
-| `could not connect` / `Permission denied` on **your own** seat | Re-run `sudo ./setup_users.sh` (needed after a reboot or a code change). Make sure the `sudo -u` user matches the seat name. |
-| `run_game.sh`: `/opt/werewolf is out of date` | You edited code; re-run `sudo ./setup_users.sh` |
-| `run_game.sh`: `/run/werewolf/playerN missing` | You rebooted, or set up fewer seats than `-n`. Run `sudo N_PLAYERS=<n> ./setup_users.sh` |
-| The moderator logs `rejected a connection for playerN: uid ... may not sit in playerN` | A player was started as the wrong user (e.g. `sudo -u player2 ... player1`) |
-| Player: `the moderator hung up before WELCOME, most likely because it rejected our certificate` | Read the moderator's log for the reason: `PEER_DID_NOT_RETURN_A_CERTIFICATE`, `CERTIFICATE_VERIFY_FAILED` (certificate from another CA: re-run `make_certs.sh` with the same `-o` and copy the new files), or `certificate is for ...` |
-| Player: `certificate verify failed: IP address mismatch` / `Hostname mismatch` | `--host` isn't in the moderator's certificate. Reissue with `sudo ./make_certs.sh -s DNS:<name> -s IP:<addr> ...` |
-| Remote player: `could not connect: ... Connect call failed` / `timed out` | The moderator isn't listening on an address the player can reach (`run_game.sh --host <its LAN address>`, not `127.0.0.1`), or firewalld is blocking the port: `--open-firewall`, or the rules under [Opening the port on Fedora](#opening-the-port-on-fedora-firewalld) |
-| Remote player: odd protocol errors (`malformed`, `unexpected ... frame`) | Different code versions on the two machines: re-run `deploy_remote.sh` and compare the `commslib.py` checksums it prints |
-| `can't load TLS files ... Permission denied` | Run the player as the Linux user that owns `DIR/<name>/key.pem`, or run `make_certs.sh` without `-U` as root |
-| `AF_UNIX path too long` in development mode | Use a short `--dir` such as `/tmp/ww`: Linux limits socket paths to 108 bytes |
-| Terminal left without echo after a crash | Type `reset` and press Enter (you won't see it as you type) |
-| Blocked only on an SELinux system | Check `sudo ausearch -m AVC,USER_AVC -ts recent` and `ls -Z /opt/werewolf /run/werewolf`; `sudo restorecon -Rv /opt/werewolf /run/werewolf` restores the default labels. Processes started with `sudo -u` from a shell normally run unconfined, so no denials are expected. |
+| Symptom | Cause | Fix |
+|---|---|---|
+| Remote player: `could not connect: [Errno 113] Connect call failed ('<ADDR>', 5555)` at once | firewalld rejects the port | Open 5555/tcp on the moderator's machine (see Multi-host) |
+| `could not connect: no answer from <ADDR>:5555 within the connect timeout ...` | Wrong address, or a firewall silently dropping packets | Check `--host`; check the firewall on and between the machines |
+| `certificate verify failed: IP address mismatch` / `Hostname mismatch`; or `run_game.sh`: `the moderator's certificate doesn't list '<ADDR>'` | The address players dial isn't in the moderator's certificate (SAN) | Re-run `sudo ./make_certs.sh -s ...` with every name/IP, then `deploy_remote.sh` again |
+| `certificate verify failed: certificate is not yet valid` | The player machine's clock is behind the machine that made the certificates | Sync the clocks (`timedatectl`; chronyd), or reissue the certificates |
+| `could not connect: can't load TLS files for 'player1' ... Permission denied` | Started as the wrong Linux user (e.g. `sudo -u player2 ... player1`), or certificates made with `-U` | Run as the user that owns `/etc/werewolf/tls/<seat>/key.pem`; re-run `sudo ./make_certs.sh` |
+| `run_game.sh`: `/opt/werewolf is out of date (...)` | Code changed since the last install | `sudo ./setup_users.sh` (and `deploy_remote.sh` for other machines) |
+| `run_game.sh`: `no certificate for player6 ...` | More seats than certificates | `sudo N_PLAYERS=6 ./setup_users.sh && sudo N_PLAYERS=6 ./make_certs.sh` |
+| Player: `the moderator hung up before WELCOME, most likely because it rejected our certificate` | Certificate from an old CA (e.g. after `make_certs.sh -f`); the moderator's log says why | Redeploy the new certificates to every machine |
+| `Permission denied` that the file modes don't explain | SELinux (looks identical) | `sudo ausearch -m AVC,USER_AVC -ts recent`; `sudo restorecon -Rv /opt/werewolf /etc/werewolf` (*not verified*) |
 
-## Uninstalling
+## Cleanup and limitations
 
 ```bash
-sudo ./teardown_users.sh                 # or: sudo N_PLAYERS=6 ./teardown_users.sh if you set up 6 seats
+sudo ./teardown_users.sh                   # users, group, /opt/werewolf, /etc/werewolf (N_PLAYERS=6 if you made 6)
+sudo firewall-cmd --remove-port=5555/tcp   # if you opened it (add --permanent and --reload for a permanent rule; not verified)
 ```
 
-This stops any running game processes, then removes the `modbot` and `player1…N` users, the `werewolf` group, `/opt/werewolf`, `/run/werewolf` and the certificates in `/etc/werewolf`.
+On each player machine (*verified between containers only*):
+
+```bash
+scp teardown_users.sh <USER>@<PLAYER_HOST>: && ssh -t <USER>@<PLAYER_HOST> sudo ./teardown_users.sh
+```
+
+**Files not to commit:** certificates and keys (`certs/`, `*.key`, `*.pem`, `*.csr`, `*.srl`; already in `.gitignore`). `make_certs.sh` writes to `/etc/werewolf/tls`, outside the repository, unless given `-o`.
+
+**Known limitations:**
+- Identity is possession of the key: root, or anyone holding a copied key, can take that seat. (Project 1 also checked the kernel-reported uid; that's impossible over TCP.)
+- A session survives network failures, not a player *process* restart: the token is in memory only, so a restarted player is refused until the game ends.
+- A player gone longer than `--resume-timeout` (120 s) stays "alive" but silent for the rest of the game.
+- No limit on concurrent unauthenticated connections; the CA key lives on the moderator's machine.
+- No protocol version check: all machines must run the same `commslib.py` (`deploy_remote.sh` prints checksums).
+- The moderator's terminal shows every role. Bots play randomly. Player input has no line editing.
+- Setting `SSLKEYLOGFILE` makes both ends write TLS secrets to that file (Python's `ssl` default).

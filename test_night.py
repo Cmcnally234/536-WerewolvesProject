@@ -36,7 +36,7 @@ def seats(seed: int) -> dict[str, list[str]]:
 def run(seed: int, modes: dict[str, str], nights: int = 1):
     """Play `nights` nights. modes: seat -> "act" | "silent". Returns (mod log, seconds, logs)."""
     with tempfile.TemporaryDirectory(prefix="ww-") as tmp:
-        mod_net, player_net = net_args(os.path.join(tmp, "s"))
+        mod_net, player_net = net_args()
         start = time.monotonic()
         mod = subprocess.Popen(
             [sys.executable, os.path.join(HERE, "moderator.py"), *PLAYERS, *mod_net,
