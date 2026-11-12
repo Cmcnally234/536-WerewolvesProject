@@ -1,4 +1,4 @@
-# Werewolf: a multi-process game over UNIX domain sockets (CSE 522 P1)
+# Werewolf: a multi-process, multi-machine game (CSE 522 P1 + P2)
 
 > ## Communications library: **`commslib.py`**
 >
@@ -36,6 +36,8 @@ A Werewolf / Mafia social deduction game for 4–6 players:
 - **Standard library only.** Nothing to `pip install`.
 - **`sudo`**, to create the game's Linux users and its socket directory.
 - **Standard system tools:** `useradd`, `groupadd`, `usermod`, `userdel`, `install`, `setsid` and `pkill`. These are present on Fedora, RHEL, Debian and Ubuntu by default.
+- **For TCP/TLS and multiple machines:** `openssl` (for `make_certs.sh`), and `ssh`/`scp` from the moderator's machine to each player machine (for `deploy_remote.sh`). An open TCP port on the moderator's machine is needed too ([firewalld rules](#opening-the-port-on-fedora-firewalld)).
+- **Optional:** `podman`, for the multi-host test `test_deploy.sh`.
 - **A terminal for each human player.** Bot players need no terminal.
 
 ## Setup
@@ -103,6 +105,11 @@ The moderator waits up to 120s for every seat to connect, then the game begins. 
 | `-n 4\|5\|6` | Number of seats (default 5; you need at least this many from `setup_users.sh`) |
 | `-H 1,2` | Seats played by humans (default: none) |
 | `-S 4` | Seats played by *silent* bots that never respond. Use this to see the moderator's timeouts. |
+| `--port N` | Play over TCP + mutual TLS on port N instead of UNIX sockets (needs `sudo ./make_certs.sh`) |
+| `--host ADDR` | With `--port`: the moderator's address (default `127.0.0.1`). The moderator listens there, local seats connect there, and remote players must use it, so it must be one of the names/IPs in the moderator's certificate. `run_game.sh` checks this before starting. |
+| `--tls DIR` | Certificate directory (default `/etc/werewolf/tls`) |
+| `-R 3,4` | Seats played **on other machines** (see [Playing across machines](#playing-across-machines)); the command to run there is printed |
+| `--open-firewall` | Open `--port` in firewalld for this game only (a runtime rule, removed when the game ends) |
 | `-- ARGS` | Everything after `--` is passed to `moderator.py`, e.g. `-- --night-timeout 20 --discussion 30 --join-timeout 300` |
 | `-h` | Show the usage |
 
@@ -178,6 +185,74 @@ sudo -u player1 python3 /opt/werewolf/player.py player1 --port 5555
 ```
 
 `make_certs.sh` options: `-o DIR` (output), `-s SAN` (repeatable; the moderator's names and IPs, which replace the default `DNS:localhost`, `IP:127.0.0.1`, `DNS:$(hostname)`), `-f` (new CA), `-U` (don't chown). Re-running keeps the CA. The layout is in [DISTRIBUTED.md](DISTRIBUTED.md#certificates-make_certssh).
+
+### Playing across machines
+
+Each player can run on a different computer, still as its own Linux user, talking to the moderator over TCP with mutual TLS. Every machine needs Python 3.11+, `sudo`, and `ssh` access from the moderator's machine. Below, the moderator's machine is `192.168.1.10` (name `mod.lan`), and seats 3–5 play on two other machines.
+
+**On the moderator's machine:**
+
+```bash
+sudo ./setup_users.sh                               # users, /opt/werewolf (as before)
+# Certificates. -s lists EVERY name/IP players will use to reach this machine;
+# players check the address they dial against this list.
+sudo ./make_certs.sh -s DNS:localhost -s IP:127.0.0.1 -s IP:192.168.1.10 -s DNS:mod.lan
+
+# Install the code + each remote seat's certificate on its machine (ssh/scp; asks
+# for your sudo password there). Only those seats' keys are sent, never the CA key.
+./deploy_remote.sh alice@192.168.1.21 player3 player4
+./deploy_remote.sh bob@192.168.1.22 player5
+
+# Start the game. --open-firewall opens the port for this game only (see below).
+sudo ./run_game.sh --host 192.168.1.10 --port 5555 -R 3,4,5 --open-firewall
+```
+
+**On each player machine**, once the moderator is waiting:
+
+```bash
+sudo /opt/werewolf/run_players.sh --host 192.168.1.10 --port 5555 player3 player4          # bots
+sudo /opt/werewolf/run_players.sh --host 192.168.1.10 --port 5555 -H player3 player3 player4   # player3 human
+```
+
+A human seat is played with the printed command: `sudo -u player3 python3 /opt/werewolf/player.py player3 --host 192.168.1.10 --port 5555`.
+
+| `deploy_remote.sh` option | Meaning |
+|---|---|
+| `USER@HOST SEAT...` | Where to install, and which seats' certificates to send (`moderator` for a separate moderator host) |
+| `-p PORT` | ssh port (default 22) |
+| `-i FILE` | ssh identity file |
+| `-t DIR` | local certificate directory (default `/etc/werewolf/tls`) |
+
+On the target, `deploy_remote.sh`:
+- creates the seats' Linux users (and the `werewolf` group);
+- installs the game code to `/opt/werewolf` (`root:werewolf 0750`);
+- installs `/etc/werewolf/tls/ca.crt` and each seat's `cert.pem`/`key.pem` in `/etc/werewolf/tls/<seat>/`, owned by that seat, directory `0700`, key `0600`.
+
+It then prints the remote `commslib.py` checksum next to the local one. **Re-run it after every code change**: machines with different `commslib.py` versions don't speak the same protocol.
+
+`run_players.sh` options: `--host`, `--port` (both required), `--tls DIR`, `-H` / `-S` seat lists (by name), and `-- ARGS` for extra `player.py` flags.
+
+#### Opening the port on Fedora (firewalld)
+
+The moderator's machine must accept TCP connections on the game port. Players only make outgoing connections, so they need no rule. Check which zone the network interface is in first:
+
+```bash
+sudo firewall-cmd --get-active-zones                 # e.g. "FedoraWorkstation  interfaces: enp3s0"
+```
+
+| Goal | Command |
+|---|---|
+| Open for now (until reboot or `--reload`) | `sudo firewall-cmd --add-port=5555/tcp` |
+| Open permanently | `sudo firewall-cmd --permanent --add-port=5555/tcp && sudo firewall-cmd --reload` |
+| Only from your LAN (recommended) | `sudo firewall-cmd --permanent --add-rich-rule='rule family="ipv4" source address="192.168.1.0/24" port port="5555" protocol="tcp" accept' && sudo firewall-cmd --reload` |
+| A non-default zone | add `--zone=<zone>` to each command above |
+| See what's open | `sudo firewall-cmd --list-ports; sudo firewall-cmd --list-rich-rules` |
+| Close it again | `sudo firewall-cmd --permanent --remove-port=5555/tcp && sudo firewall-cmd --reload` (and `--remove-rich-rule='...'` for the LAN rule) |
+
+`run_game.sh --open-firewall` does the "open for now" step and closes the port again when the game ends. It never adds a permanent rule.
+
+- **SELinux:** no port labelling (`semanage port`) is needed. The game's processes are started with `sudo -u` from a shell and run as `unconfined_t`, which may bind any unprivileged port.
+- **Why mutual TLS is enough:** with the port open, anyone on the network can *connect*, but without a certificate signed by the game's CA they're refused during the TLS handshake. See [DISTRIBUTED.md](DISTRIBUTED.md).
 
 ### Rules
 
@@ -387,6 +462,9 @@ The game's own message types (`ROLE_ASSIGN`, `NIGHT_PROMPT`, `CHAT`, `VOTE_TALLY
 | `run_game.sh` | Starts a game as real users: the moderator, the bots, and printed commands for the human seats. Run with sudo. |
 | `teardown_users.sh` | Uninstall: removes the users, groups, `/opt/werewolf`, `/run/werewolf` and `/etc/werewolf`. Run with sudo. |
 | `make_certs.sh` | Creates the game CA, the moderator's certificate and one per player (keys 0600, owned by their Linux users when run as root) |
+| `deploy_remote.sh` | Installs the code and given seats' certificates on another machine over ssh/scp (see [Playing across machines](#playing-across-machines)) |
+| `run_players.sh` | Starts one machine's seats for a game whose moderator runs elsewhere (installed on player machines by `deploy_remote.sh`) |
+| `test_deploy.sh`, `cluster.sh` | Automated multi-host test: three podman containers act as three machines; deploys over real ssh and plays a game across them |
 | `test_tls.sh` | Checks who gets a seat over TLS (valid, missing, foreign or stolen certificates; impostor moderators); with sudo, also the key ownership |
 | `tls_server.py`, `tls_probe.py` | Helpers used by `test_tls.sh` |
 | `test_permissions.sh` | Checks that each player can reach only its own socket, and that SO_PEERCRED rejects impostors. Run with sudo after setup. |
@@ -432,6 +510,23 @@ The commslib demo on its own (one slow client shows the timeout):
 ```bash
 python3 ping_server.py & python3 ping_client.py p1 & python3 ping_client.py p2 & python3 ping_client.py p3 --delay 3 & wait
 ```
+
+### 0b. Multi-host test (needs podman, no sudo, a few minutes the first time)
+
+Three containers stand in for three machines, each with its own network address, users and sshd. The test:
+1. runs `setup_users.sh` and `make_certs.sh` on the "moderator machine";
+2. deploys to the other two with `deploy_remote.sh` (real ssh, scp and sudo);
+3. checks what landed there: owners, modes, and no stray keys;
+4. checks `run_game.sh`'s refusals;
+5. plays one game across all three.
+
+```bash
+./test_deploy.sh               # expect: 19 passed, 0 failed
+KEEP=1 ./test_deploy.sh        # leave the containers running, to look around:
+podman exec -it ww-pa bash     #   e.g. ls -l /etc/werewolf/tls; podman rm -f ww-mod ww-pa ww-pb when done
+```
+
+The first run builds a Fedora image (`localhost/werewolf-host`) with dnf, so it needs network access.
 
 ### 1. Set up users and confirm isolation
 
@@ -515,6 +610,8 @@ sudo -u player2 python3 /opt/werewolf/player.py player2
 | The moderator logs `rejected a connection for playerN: uid ... may not sit in playerN` | A player was started as the wrong user (e.g. `sudo -u player2 ... player1`) |
 | Player: `the moderator hung up before WELCOME, most likely because it rejected our certificate` | Read the moderator's log for the reason: `PEER_DID_NOT_RETURN_A_CERTIFICATE`, `CERTIFICATE_VERIFY_FAILED` (certificate from another CA: re-run `make_certs.sh` with the same `-o` and copy the new files), or `certificate is for ...` |
 | Player: `certificate verify failed: IP address mismatch` / `Hostname mismatch` | `--host` isn't in the moderator's certificate. Reissue with `sudo ./make_certs.sh -s DNS:<name> -s IP:<addr> ...` |
+| Remote player: `could not connect: ... Connect call failed` / `timed out` | The moderator isn't listening on an address the player can reach (`run_game.sh --host <its LAN address>`, not `127.0.0.1`), or firewalld is blocking the port: `--open-firewall`, or the rules under [Opening the port on Fedora](#opening-the-port-on-fedora-firewalld) |
+| Remote player: odd protocol errors (`malformed`, `unexpected ... frame`) | Different code versions on the two machines: re-run `deploy_remote.sh` and compare the `commslib.py` checksums it prints |
 | `can't load TLS files ... Permission denied` | Run the player as the Linux user that owns `DIR/<name>/key.pem`, or run `make_certs.sh` without `-U` as root |
 | `AF_UNIX path too long` in development mode | Use a short `--dir` such as `/tmp/ww`: Linux limits socket paths to 108 bytes |
 | Terminal left without echo after a crash | Type `reset` and press Enter (you won't see it as you type) |

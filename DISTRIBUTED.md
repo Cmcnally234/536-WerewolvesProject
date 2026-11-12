@@ -100,6 +100,32 @@ So an impostor moderator can't collect votes or whispers. `test_tls.sh` checks a
 
 **Shutdown during a handshake:** `Server.close()` cancels the tasks of connections that aren't seated yet; it doesn't close their transports directly. Closing a transport cleanly in the middle of a TLS handshake hits a CPython quirk: `SSLProtocol.connection_lost(None)` wakes the handshake waiter with no exception, so `start_tls()` *returns*, with no transport, instead of raising. Cancelling the task takes asyncio's own cleanup path instead.
 
+## Deployment (multiple machines)
+
+```
+ admin machine = moderator machine (holds the CA)        player machines
+ +------------------------------------------+            +---------------------------+
+ | setup_users.sh   -> modbot, player1..N   |  ssh/scp   | deploy_remote.sh puts:    |
+ | make_certs.sh -s <its names/IPs>         | ---------> |  users player3, player4   |
+ |   /etc/werewolf/tls/{ca.crt,ca.key,      |  (bundle:  |  /opt/werewolf/*.py       |
+ |      moderator/, player1/ .. playerN/}   |  code +    |  /etc/werewolf/tls/       |
+ | run_game.sh --host <addr> --port P -R .. |  ca.crt +  |    ca.crt, player3/,      |
+ |   moderator (modbot) listens on addr:P   |  only the  |    player4/ (own user,    |
+ |   local seats as player1, player2        |  host's    |    0700 / key 0600)       |
+ +------------------------------------------+  seats)    | run_players.sh --host ..  |
+                ^                                         +---------------------------+
+                |        TCP + mutual TLS, port P (firewalld: open on the moderator only)
+                +-----------------------------------------------------------+
+```
+
+- **What goes where.** A player machine receives the game code, `ca.crt` (to check the moderator), and the certificate and key of *its own seats only*. The CA key stays on the machine that ran `make_certs.sh`, and so do the moderator's key and every other seat's key. So a compromised player machine can impersonate only the seats deployed to it.
+- **The bundle in transit.** `deploy_remote.sh` builds it locally under `umask 077` and copies it with `scp -p` (encrypted, modes kept) into a fresh `mktemp -d` directory on the target. It runs the install step there with `ssh -t … sudo` (`-t` so sudo can ask for a password). The bundle is deleted afterwards whether or not the install succeeded, so no copy of a key is left in `/tmp`.
+- **Ownership on the target:** each `/etc/werewolf/tls/<seat>/` is `<seat>:<seat> 0700`, its `key.pem` is `0600`, and `/opt/werewolf` is `root:werewolf 0750`. This is the same layout `make_certs.sh` produces as root, so `commslib.tls_paths()` finds the files on every machine.
+- **One address for everything.** `run_game.sh --host ADDR` is where the moderator listens, where its local seats connect, and what remote players dial, so `ADDR` must be in the moderator certificate's SANs. `run_game.sh` checks this with `openssl x509 -checkip/-checkhost` before starting. It also refuses remote seats with a loopback `--host`.
+- **Versions.** The wire protocol has no version number, so every machine must run the same `commslib.py`. `deploy_remote.sh` prints the checksum on both ends; re-run it after any code change.
+- **Firewall.** Only the moderator's machine accepts connections: one TCP port. Player machines connect out and need no rule. The firewalld commands are in the README, and `run_game.sh --open-firewall` adds a runtime-only rule for the length of one game.
+- **Tested** by `test_deploy.sh` on three podman containers, each with its own network namespace, users and sshd. It uses real `ssh`/`scp`/`sudo`, checks ownership, modes and that no stray keys landed, then plays a game with the moderator and two seats on one "machine" and three seats on two others.
+
 ## Socket options (TCP, both ends)
 
 | Option | Value | Why |

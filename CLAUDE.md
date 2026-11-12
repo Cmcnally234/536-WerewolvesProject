@@ -36,10 +36,13 @@ Python 3.14, Fedora (SELinux enforcing). Standard library only.
 | `DISTRIBUTED.md` | Project 2 protocol doc: transports, handshake, socket options, failure model; later stages fill in heartbeat / seq-ack / resume. Keep in sync with commslib. |
 | `test_game.py` | Whole games (winner matches the rules, everyone exits 0, no socket files left), SIGTERM/SIGINT to the moderator, SIGTERM to a player mid-game, SIGSTOP a player (away within the heartbeat limit, then resumes with exactly the broadcasts everyone got), SIGSTOP past `--resume-timeout` (dropped, resume refused). `Run` timestamps moderator lines (`wait_for_log`) and reads logs live (`received`). |
 | `README.md` | Grader-facing (someone else runs this on another machine): commslib name/location callout at the top, requirements, setup, "no compilation needed", how to play, the full **commslib API reference** (with a tested example), file list, testing guide, troubleshooting, uninstall. Keep it in sync when the API or flags change. |
-| `run_game.sh` | Launches one game as real users: the moderator (foreground, as modbot) and the bot seats (background, `setsid sudo -u playerN`). Prints the command for each human seat. Refuses stale `/opt/werewolf` code. |
+| `run_game.sh` | Launches one game as real users: the moderator (foreground, as modbot) and the bot seats (background, `setsid sudo -u playerN`). Prints the command for each human seat. Refuses stale `/opt/werewolf` code. `--port/--host/--tls` for TCP+TLS (checks `--host` is in the moderator cert's SANs), `-R` remote seats, `--open-firewall` (runtime firewalld rule, removed at exit). |
+| `deploy_remote.sh` | `USER@HOST SEAT...`: bundles code + `ca.crt` + only those seats' cert/key (umask 077; `sudo tar` locally if the keys aren't readable), `scp -p` to a remote `mktemp -d`, then `ssh -t sudo bash install.sh` (creates users, `/opt/werewolf` root:werewolf 0750, `/etc/werewolf/tls/<seat>` seat 0700 / key 0600, restorecon, prints commslib checksum). Always removes the remote bundle. `moderator` → user modbot. |
+| `run_players.sh` | Player-host launcher (installed to `/opt/werewolf` by deploy_remote): `--host --port [--tls] [-H/-S names] SEAT... [-- player args]`; bots in background as their users, waits, summary; Ctrl-C → bots leave with BYE. |
+| `cluster.sh`, `test_deploy.sh` | Podman "LAN" (ww-mod, ww-pa, ww-pb on network wwnet, sshd, admin with NOPASSWD sudo, image `localhost/werewolf-host:4`); `cluster_up/down`, `cx`, `cx_admin`. `test_deploy.sh`: 19 checks (deploy, ownership/modes, no stray keys, run_game refusals, a game across 3 hosts). `KEEP=1` keeps containers. Also the base for stage 6. |
 | `ARCHITECTURE.md` | Writeup material: topology diagram, commslib/framing, permissions, message table, concurrency, rules, tests, limitations. |
 
-There is no `deploy.sh`: `setup_users.sh` is the deploy step.
+`setup_users.sh` is the deploy step for this machine; `deploy_remote.sh` deploys to other machines over ssh.
 
 ## Commands
 
@@ -118,7 +121,10 @@ WW_TRANSPORT=tcp python3 test_game.py   # any of the 4 process tests, over local
 python3 ping_server.py & for p in p1 p2 p3; do python3 ping_client.py $p & done; wait   # optional --delay 3 on one client
 sudo ./test_permissions.sh      # real users only
 ./test_tls.sh                   # 14 checks; sudo ./test_tls.sh adds key ownership (21)
+./test_deploy.sh                # podman, no sudo: 19 checks, deploy + a game across 3 container "hosts"
 ```
+
+Across machines: `sudo ./make_certs.sh -s IP:<mod addr> ...`, `./deploy_remote.sh user@host player3 player4`, `sudo ./run_game.sh --host <mod addr> --port 5555 -R 3,4 [--open-firewall]`, then on the player host `sudo /opt/werewolf/run_players.sh --host <mod addr> --port 5555 player3 player4`.
 
 TCP + TLS by hand: `./make_certs.sh -o /tmp/pki p1 p2 p3 p4 p5`, then add `--port 5555 --tls /tmp/pki` to the moderator and every player.
 
@@ -136,6 +142,9 @@ TCP + TLS by hand: `./make_certs.sh -o /tmp/pki p1 p2 p3 p4 p5`, then add `--por
 - **Heartbeats change Project 1 behaviour:** a player suspended (Ctrl-Z) for more than ~6s is now dropped. Use `--heartbeat`/`--heartbeat-misses` to loosen it.
 - **`pkill -f <pattern>` can kill your own shell** if the pattern appears in the command line running it; use a script or exact PIDs.
 - **Don't close transports mid-TLS-handshake.** A clean close makes `start_tls()` return with a `None` transport instead of raising (CPython quirk). `Server.close()` cancels the `_handshaking` tasks instead.
+- **`$?` after `$(...)` in the same command is the substitution's status.** run_game.sh's summary printed every bot as exit 0 for that reason (fixed: save `code=$?` right after `wait`).
+- **`umask 077` + `mkdir -p` makes missing parents 0700 too.** make_certs.sh creates `$OUT` under `umask 022` so `/etc/werewolf` stays traversable (found by test_deploy.sh; test_tls.sh's temp dirs hid it).
+- **Cluster containers:** sshd there needs `PerSourcePenalties no`, an unlocked account (`usermod -p '*'`), `pam_loginuid` optional, and `podman exec -u` needs `-e HOME=...`. `firewalld` isn't in the containers, so `--open-firewall` is untested there.
 - In this dev shell, `ls` is aliased to a different tool. Use `/usr/bin/ls` when exit codes or exact output matter.
 
 ## Messages

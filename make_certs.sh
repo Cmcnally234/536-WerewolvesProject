@@ -97,7 +97,10 @@ if [[ $CHOWN -eq 1 ]]; then
     done
 fi
 
-mkdir -p "$OUT"
+# umask 022 just for this: under the script's 077, mkdir -p would also make
+# any missing PARENT (e.g. /etc/werewolf) 0700 root -- and then nobody but
+# root could reach the certificates inside, whatever their own modes.
+(umask 022; mkdir -p "$OUT")
 chmod 0755 "$OUT"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
