@@ -6,3 +6,4 @@ certs/
 *.pem
 *.csr
 *.srl
+CLAUDE.md
