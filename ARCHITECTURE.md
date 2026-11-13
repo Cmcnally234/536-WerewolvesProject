@@ -1,44 +1,62 @@
 # Architecture
 
-> **This document describes Project 1** (git tag `project1`): UNIX domain sockets on one machine. Project 2 added TCP + mutual TLS, heartbeats and resumable sessions; that design is in [DISTRIBUTED.md](DISTRIBUTED.md). Some internal names used below have changed since (`_serve_player` is now `_serve_link`, the client's `_read_loop` is now `_run`, and the send lock was replaced by synchronous `Connection.write()`).
-
-A Werewolf / Mafia game in which **every player is a separate OS process running as a separate Linux user**. All communication goes through one file, `commslib.py`, which wraps **UNIX domain stream sockets driven by asyncio**. Python 3.14, standard library only.
+A Werewolf / Mafia game in which **every player is a separate OS process running as a separate Linux user**, on one machine or several. All communication goes through one file, `commslib.py`: **TCP stream sockets with mutual TLS 1.3, driven by asyncio**. Python 3.14, standard library only. (Project 1 used UNIX domain sockets on one machine; it is the git tag `project1`.) This document is the overview; `DISTRIBUTED.md` has the wire protocol in full detail.
 
 ## 1. Processes, users and the star topology
 
 ```
-                         /run/werewolf/                (modbot:werewolf 0750)
-                         ├── player1/sock   ◄──────────── player1 process  (Linux user player1)
-                         ├── player2/sock   ◄──────────── player2 process  (Linux user player2)
-  moderator process  ────┼── player3/sock   ◄──────────── player3 process  (Linux user player3)
-  (Linux user modbot)    ├── player4/sock   ◄──────────── player4 process  (Linux user player4)
-  listens on all N       └── player5/sock   ◄──────────── player5 process  (Linux user player5)
-
-  Each playerN/ directory: modbot:playerN, mode 2750 (setgid).  Each sock: mode 0660.
-  Players never connect to each other. Every message goes through the moderator.
+          <MODERATOR_HOST>                              <PLAYER_HOST_A>
+  +----------------------------------+   TCP + TLS   +-----------------------------+
+  | moderator.py   (Linux user       |<=============>| player.py  (Linux user      |
+  |   modbot), listens on :5555      |<=============>| player.py   player3/player4)|
+  | player.py (player1) --TLS--+     |               +-----------------------------+
+  | player.py (player2) --TLS--+     |   TCP + TLS   +-----------------------------+
+  +----------------------------------+<=============>| player.py  (player5)        |
+                                                     +-----------------------------+
+  Every player connects only to the moderator (also the ones on its own machine,
+  over 127.0.0.1). Players never connect to each other.
 ```
 
-- **Star topology.** The moderator is the hub. It is the only process that knows every role, and it decides who receives each message. Because every message passes through it, the hub can deliver to one player (1:1), to a chosen subset (multicast), or to everyone (broadcast).
-- **One listening socket per seat**, rather than one shared socket. The moderator knows *who* a connection belongs to from *which socket it arrived on*. File permissions ensure only `playerN` can open `playerN/sock`, so a player cannot claim to be someone else by lying in a message.
-- **Code location.** The code is installed to `/opt/werewolf` (`root:werewolf 0750`) by `setup_users.sh`, because the developer's home directory is mode 700 and the game users couldn't read it there.
-- **Launching.** `run_game.sh` starts the moderator with `sudo -u modbot` and each bot seat with `sudo -u playerN`; human seats are started the same way, one terminal each.
+- **Star topology.** The moderator is the hub. It is the only process that knows every role, and it decides who receives each message. Because every message passes through it, it can deliver to one player (1:1), to a chosen subset (multicast), or to everyone (broadcast).
+- **One listening port for everybody** (`host:port`, default `127.0.0.1:5555`). The socket can't tell the moderator who is on a connection. The player's **TLS certificate** does: its CN is the seat name, and the certificate is verified against the game's own CA (section 3).
+- **Code location.** `setup_users.sh` installs the code to `/opt/werewolf` (`root:werewolf 0750`), because the developer's home directory is mode 700 and the game users couldn't read it there. `deploy_remote.sh` does the same on other machines.
+- **Launching.** `run_game.sh` starts the moderator with `sudo -u modbot` and each bot seat with `sudo -u playerN`. Human seats are started the same way, one terminal each; seats on other machines are started there with `run_players.sh`.
 
 ## 2. `commslib.py`, the single communication file
 
-`moderator.py` and `player.py` import only `Server`, `Client`, `ConnectionClosed` and `player_socket_path` from it. Neither touches a socket directly.
+### 2.1 The primitive
+
+- **TCP (`AF_INET`, `SOCK_STREAM`)** gives a reliable, ordered byte stream between two processes on any two machines. The kernel retransmits lost packets and delivers the bytes in order, but it delivers *bytes*, not messages, and it can't say who is on the other end.
+- **TLS 1.3** runs on top of that stream. It encrypts and integrity-protects every byte, and, because both sides present certificates (*mutual* TLS), it authenticates both ends.
+- **asyncio streams** (`asyncio.start_server`, `asyncio.open_connection`, `StreamWriter.start_tls`) drive both from one event loop, so one process can serve many connections without threads.
+
+**Why this primitive:**
+- Players must run on other machines, which rules out UNIX domain sockets (one machine only) and pipes.
+- Plain TCP would send roles and wolf whispers in clear, and would let anyone who reaches the port claim any seat. TLS fixes both.
+
+`commslib.py` builds three layers on the TLS stream, each covered below:
+
+| Layer | Class | Job |
+|---|---|---|
+| Framing | `Connection` | Cut the byte stream into messages (2.2); detect dead links (heartbeats, 2.5) |
+| Session | `_Session` | Number messages, keep them until acknowledged, replay after a reconnect (2.5) |
+| Endpoints | `Server`, `Client` | Listening, TLS handshake, seat assignment, 1:1/multicast/broadcast, reconnecting |
+
+`moderator.py` imports only `Server` (plus default constants) from it, and `player.py` only `Client` and `ConnectionClosed`. Neither touches a socket.
 
 | API | Side | What it does |
 |---|---|---|
-| `Connection.send(msg)` / `recv()` / `close()` | both | One framed, bidirectional link over an asyncio `StreamReader`/`StreamWriter` pair |
-| `Server.start(player_ids, base_dir, check_peer_uid)` | moderator | `asyncio.start_unix_server` on `<base_dir>/<id>/sock` for each seat; `chmod 0660` |
-| `Server.send_to(id, msg)` | moderator | 1:1 |
-| `Server.multicast(ids, msg)` | moderator | Sends to a subset concurrently (`asyncio.gather`); returns the ids it couldn't reach |
-| `Server.broadcast(msg)` | moderator | `multicast` to every connected seat |
-| `Server.recv_any(timeout)` | moderator | Next `(player_id, msg)` from **any** player; raises `TimeoutError` |
-| `Server.wait_for_players(timeout)` | moderator | Waits until every seat is connected |
-| `Client.connect(path)` / `send(msg)` / `recv(timeout)` / `close()` | player | `asyncio.open_unix_connection`, with a short retry while the moderator starts up |
+| `Server.start(players, host=, port=, tls_dir=)` | moderator | One TCP listener; each accepted connection is upgraded to TLS before anything else is read |
+| `Server.wait_for_players(timeout)` | moderator | Waits until every seat has joined |
+| `Server.send_to(id, msg)` | moderator | **1:1** |
+| `Server.multicast(ids, msg)` | moderator | **Multicast**: sends to a subset concurrently (`asyncio.gather`); returns the ids that have no session |
+| `Server.broadcast(msg)` | moderator | **Broadcast**: `multicast` to every player still in the game |
+| `Server.recv_any(timeout)` | moderator | Next `(player_id, msg)` from **any** player, or a lifecycle event; raises `TimeoutError` |
+| `Server.wait_for_delivery(timeout)`, `close()` | moderator | Wait until every player has acknowledged everything; then shut down |
+| `Client.connect(player_id=, host=, port=, tls_dir=)` | player | TLS connect + handshake; retries briefly while the moderator starts |
+| `Client.send(msg)` / `recv(timeout)` / `close()` | player | Send to the moderator; next message from it; leave the game |
 
-### 2.1 Framing protocol
+### 2.2 Framing protocol
 
 ```
 +----------------------+--------------------------------+
@@ -47,63 +65,77 @@ A Werewolf / Mafia game in which **every player is a separate OS process running
 +----------------------+--------------------------------+
 ```
 
-**Why a stream socket needs framing:** `SOCK_STREAM` delivers a byte stream with **no message boundaries**.
+**Why a stream socket needs framing:** `SOCK_STREAM` delivers a byte stream with **no message boundaries**, and TLS doesn't add any.
 - Two quick sends can arrive in one read.
-- A large send can arrive split across several reads. The test suite sends a 300 KB frame to force this.
+- A large send can arrive split across several reads. The tests send a 300 KB frame to force this.
 
-The length prefix tells the receiver exactly where each message ends. `recv()` calls `readexactly(4)` for the header, then `readexactly(N)` for the body. `readexactly` keeps reading until it has exactly that many bytes, which is exactly what framing needs. Frames over 1 MiB are refused, so a corrupted header can't make the receiver try to buffer gigabytes.
+The length prefix tells the receiver exactly where each message ends. `recv()` calls `readexactly(4)` for the header, then `readexactly(N)` for the body. `readexactly` keeps reading until it has exactly that many bytes, which is exactly what framing needs.
+- Frames over 1 MiB are refused, so a corrupted header can't make the receiver buffer gigabytes.
+- A body that isn't UTF-8, isn't JSON, or isn't a JSON object is a `ProtocolError`. The receiver hangs up on that peer; nothing it sends afterwards can be trusted.
 
-Each `Connection` has a send lock. Two tasks can send on the same connection at the same time (for example, a broadcast and a private reply), and the lock keeps their header and body bytes from interleaving on the wire.
+**Sending is one synchronous `write()`.** `Connection.write()` is a plain function, not a coroutine: header and body go to the transport in one call, and no other task can run in the middle of it. So frames from different tasks can never interleave (no lock is needed), and a frame is either entirely queued or not at all. `drain()` then waits, bounded, until the kernel has room.
 
-### 2.2 Reader tasks feeding a single inbox
+Every game message travels inside an envelope, `{"type": "DATA", "seq": n, "ack": m, "msg": {...}}`. Control frames (`HELLO`, `WELCOME`, `HEARTBEAT`, `BYE`, `error`) are never delivered to the game (2.5).
 
-**Server.** Every accepted connection gets its own task, `_serve_player`. Each task loops: `recv()` one frame, then put `(player_id, msg)` into **one shared `asyncio.Queue`**. `recv_any(timeout)` is simply `asyncio.wait_for(inbox.get(), timeout)`. Connection lifecycle events are delivered through the same queue, in order with everything else:
-- `_connected`: a player took its seat
-- `_disconnected`: a player's connection closed
-- `_rejected`: an SO_PEERCRED uid mismatch (section 3)
+### 2.3 Reader tasks feeding a single inbox
 
-**Client.** The client uses the same pattern: a background `_read_loop` task fills a queue, and `recv(timeout)` waits on the queue. This matters for timeouts. If `recv(timeout)` cancelled a socket read directly, the cancel could land after the 4-byte header had been consumed but before the body arrived. The header would be lost and every later frame misread. Cancelling a `queue.get()` is always safe, because frames only enter the queue whole.
+**Server.** Every accepted connection gets its own task:
+1. the TLS handshake (`_handshake_tls`, at most 5s);
+2. the `HELLO` (`_hello`, at most 5s);
+3. then `_serve_link`, which loops: `recv()` one frame, and put `(player_id, msg)` into **one shared `asyncio.Queue`**, the inbox.
 
-### 2.3 Shutdown
+`recv_any(timeout)` is simply `asyncio.wait_for(inbox.get(), timeout)`. Lifecycle events arrive through the same queue, in order with everything else:
 
-`Server.close()` works in this order:
-1. Stops accepting new connections.
-2. Closes every connection.
-3. Waits (2s limit per listener) for every `_serve_player` task to exit.
-4. Deletes the socket files.
+| Event | Meaning |
+|---|---|
+| `_connected` | a player took its seat (a new session) |
+| `_away` | its link broke; the seat is held for `--resume-timeout` (120s) and messages to it are kept |
+| `_resumed` | it reconnected and got what it missed |
+| `_disconnected` | its session is over for good: it left, didn't come back in time, or broke the protocol |
+| `_rejected` | a connection was refused (bad certificate, wrong seat, seat taken, bad token) |
 
-Data already passed to `send()` is still delivered. `drain()` has handed it to the kernel, and closing a UNIX stream socket delivers the queued bytes **before** the EOF.
+**Client.** The client uses the same pattern. One background task reads the link into a queue, and `recv(timeout)` waits on the queue; the same task also reconnects when the link breaks (2.5). This matters for timeouts: if `recv(timeout)` cancelled a socket read directly, the cancel could land after the 4-byte header was consumed but before the body arrived. The header would be lost and every later frame misread. Cancelling a `queue.get()` is always safe, because frames only enter the queue whole.
 
-## 3. Socket isolation and permissions
+### 2.4 Shutdown
 
-| Path | Owner:group | Mode | Effect |
+At the end of a game the moderator first calls `wait_for_delivery()`: it waits (up to `--linger`, 30s) until every player has acknowledged everything, including `GAME_OVER`. Players leave with `BYE` as soon as they have it, so on a healthy network this takes milliseconds. Over a lossy link, or with a player mid-reconnect, it's what makes sure they still get the result. Then `Server.close()`:
+1. stops accepting new connections, and cancels connections still in their handshake;
+2. sends `BYE` to every live player, so they don't try to reconnect;
+3. closes every connection, waiting up to 2s for unsent data, then aborting;
+4. waits (2s limit per listener) for every connection task to exit.
+
+### 2.5 Surviving a bad network
+
+TCP alone can't tell a *frozen* peer or a *silent partition* from a quiet one: the kernel keeps the connection open. Two mechanisms in `commslib` handle that, both described in full in `DISTRIBUTED.md`:
+
+- **Heartbeats** (`Connection.heartbeat`): both ends send `HEARTBEAT` every 2s. A peer that sends nothing for 3 of its intervals (6s) is declared dead, and its link is aborted.
+- **Resumable sessions** (`_Session`):
+  - each direction numbers its messages and keeps them until the other side acknowledges them (`ack` rides on every frame);
+  - a player whose link broke reconnects with its secret session token, and each side replays what the other missed;
+  - the receiver delivers only the next number in sequence and drops anything it already has, so nothing is lost or delivered twice.
+
+## 3. Identity and isolation
+
+| File (on each machine) | Owner | Mode | Purpose |
 |---|---|---|---|
-| `/run/werewolf/` | `modbot:werewolf` | `0750` | Game members may enter; outsiders can't even list it |
-| `/run/werewolf/playerN/` | `modbot:playerN` | `2750` | modbot creates the socket; only group `playerN` may enter |
-| `/run/werewolf/playerN/sock` | `modbot:playerN` | `0660` | `connect()` needs **write** permission on the socket file: modbot and playerN only |
+| `/etc/werewolf/tls/ca.crt` | root | `0644` | The game's CA. Both sides trust **only** this. |
+| `/etc/werewolf/tls/ca.key` | root | `0600` | Signs certificates. Only on the machine that ran `make_certs.sh`; never copied. |
+| `/etc/werewolf/tls/moderator/` | `modbot` | `0700` | The moderator's certificate (EKU serverAuth, SANs = its names/IPs) and key (`0600`) |
+| `/etc/werewolf/tls/playerN/` | `playerN` | `0700` | Player N's certificate (CN = `playerN`, EKU clientAuth) and key (`0600`) |
 
-**What the permission bits mean here:**
-- On a directory, **x** lets you pass through it and **r** lets you list it.
-- Reaching a socket needs x on every directory along its path.
-- Group `player2` has no rights on `player1/`, so player2's `connect()` fails with `EACCES` before it ever reaches the socket.
+**How a seat is taken:**
+1. TCP connect, then a TLS 1.3 handshake in which **both** sides present certificates. The moderator requires one (`CERT_REQUIRED`) signed by the game CA. The player requires the moderator's to be signed by the same CA **and** to list the address it dialled (hostname check against the SANs), so an impostor moderator is refused.
+2. The seat is the **CN of the verified player certificate**. It never comes from a message field. The player's `HELLO` must name that same seat, or it's refused; a copied certificate can't sit in another seat.
+3. The moderator replies `WELCOME` with a random 128-bit session token, used only to resume this session later.
 
-**Why setgid on the seat directory:**
-- Normally a new file gets the creating process's *primary group*, so the moderator's sockets would be `modbot:modbot`, and playerN would fall into "other" with no access.
-- With the setgid bit on a directory, files created inside it inherit the *directory's* group instead. `setup_users.sh`, running as root, decides once that `player1/` has group `player1`, and every socket the moderator later creates there is automatically `modbot:player1`.
-- As a result, modbot doesn't need to be a member of any player group.
-- `Server.start()` refuses to create missing seat directories, because a directory made by modbot would have the wrong group and the isolation would silently disappear.
+**Why that ties seats to Linux users:** `playerN`'s key is readable only by user `playerN` (mode `0600`, in a `0700` directory). So only that user, and root, can present that certificate. `sudo -u player2 ... player1` fails with `Permission denied` before it sends a byte. (Project 1 also asked the kernel for the connecting uid with SO_PEERCRED, which caught root too. Over TCP the kernel can't vouch for a remote user, so possession of the key is the proof.)
 
-**SO_PEERCRED (defence in depth, `--peercred`).** File permissions decide who *can* reach a socket. SO_PEERCRED tells the moderator who actually *did*. The kernel records the connecting process's `(pid, uid, gid)` at `connect()` time, and the client cannot forge it. `_serve_player` compares the uid with `pwd.getpwnam(player_id)` and rejects a mismatch. This catches modbot (which owns every seat directory) and root (which ignores permissions); neither would be stopped by the permission bits.
-
-`test_permissions.sh` checks all of this as real users:
-- player1 and player2 can each connect to their own socket;
-- neither can connect to the other's socket;
-- `nobody` can't connect to any socket, or even list `/run/werewolf`;
-- modbot reaches player1's socket but is rejected by SO_PEERCRED.
-
-Two operational notes:
-- **`sun_path` limit:** Linux caps a UNIX socket path at **108 bytes** (`sun_path` in `struct sockaddr_un`). `/run/werewolf/playerN/sock` is well under that.
-- **`/run` is a tmpfs:** it's emptied at every boot, so `setup_users.sh` must be re-run after a reboot.
+**Before authentication** the moderator gives each connection 5s for the TLS handshake and 5s for the `HELLO`. Anything that fails is closed and logged as `_rejected`. `test_tls.sh` checks every case:
+- a valid certificate is accepted;
+- no certificate, a certificate from another CA, plain TCP, a certificate for no seat, and someone else's certificate are all refused;
+- a taken seat is refused;
+- three impostor moderators are refused by the player;
+- with sudo, the key ownership as real users.
 
 ## 4. Message catalogue: 1:1, multicast and broadcast
 
@@ -128,7 +160,7 @@ Two operational notes:
 - `PACK_VOTES` gives the wolves something concrete to coordinate on.
 - `INFO` carries the moderator's notices.
 
-**Roles never leak.** `test_no_role_leak.py` plays full games and checks every message each villager received. Apart from their own `ROLE_ASSIGN` and the final `GAME_OVER`, nothing may contain a role name or a wolf-only or seer-only message type. The test first proves its checker catches three fabricated leaks, so it cannot pass by accident.
+**Roles never leak.** `test_no_role_leak.py` plays full games and checks every message each villager received. Apart from their own `ROLE_ASSIGN` and the final `GAME_OVER`, nothing may contain a role name or a wolf-only or seer-only message type. The test first proves its checker catches three fabricated leaks, so it cannot pass by accident. And because every link is TLS, nobody else on the network can read any of these messages either.
 
 ## 5. Concurrency
 
@@ -138,18 +170,18 @@ There are two concurrency points required by the assignment: the moderator and e
 
 The moderator is a single-threaded asyncio program. Three mechanisms work together.
 
-**(a) One reader task per connection** (commslib `_serve_player`, section 2.2). With five players, five tasks are waiting on five sockets at the same time. The game logic never reads a socket itself; it waits on the shared inbox.
+**(a) One reader task per connection** (section 2.3), plus one heartbeat task per connection. With five players, five tasks are waiting on five sockets at the same time. The game logic never reads a socket itself; it waits on the shared inbox.
 
 **(b) One deadline-bounded loop per phase:** `Game.message_loop(seconds, handle, is_done)`.
 
 ```python
-deadline = loop.time() + seconds
+deadline = self.loop.time() + seconds
 while not is_done():
-    remaining = deadline - loop.time()
+    remaining = deadline - self.loop.time()
     if remaining <= 0:
         return False                      # deadline ended the phase
     try:
-        pid, msg = await server.recv_any(timeout=remaining)
+        pid, msg = await self.server.recv_any(timeout=remaining)
     except TimeoutError:
         return False
     if not await self.handle_common(pid, msg):
@@ -169,7 +201,9 @@ return True                               # finished early
 
 The discussion timer is not a separate task or a `sleep()`. It is the `timeout=remaining` on each `recv_any`. A `sleep(60)` would let the timer run, but nobody would be reading messages during it, so chat would pile up and be relayed all at once at the end.
 
-**(c) Concurrent sends with `asyncio.gather`.** `ROLE_ASSIGN` to every player, the night prompts, and every `multicast` all run their sends at the same time. Each send awaits `drain()`, which pauses while that player's socket buffer is full; sending one at a time would let one slow reader delay everyone behind it. `multicast` uses `return_exceptions=True`, so one disconnected player can't cancel delivery to the others.
+**A player who is away** (link broken, session held) stays alive and stays in the pending lists. Messages to them queue and are replayed when they return. If they're back before the deadline they can still act; if not, the deadline treats them like any silent player. `handle_common` consumes `_away` and `_resumed`. Only `_disconnected` (gone for good) removes a player from a phase's pending list.
+
+**(c) Concurrent sends with `asyncio.gather`.** `ROLE_ASSIGN` to every player, the night prompts, and every `multicast` all run their sends at the same time. Each send awaits `drain()`, which pauses while that player's buffer is full. That wait is bounded: a player who doesn't make room within 5s has its link dropped (it becomes away, and keeps its messages). Sending one at a time would let one slow reader delay everyone behind it. `multicast` uses `return_exceptions=True`, so one missing player can't cancel delivery to the others.
 
 ### 5.2 Player: keyboard and socket at the same time
 
@@ -190,6 +224,7 @@ for t in pending:
 - **`asyncio.wait(FIRST_COMPLETED)` rather than `gather`.** `gather` waits for *both* tasks. When the moderator sends `GAME_OVER` or hangs up, the socket task ends, but the keyboard task would wait for a line forever. `FIRST_COMPLETED` returns as soon as either one ends (the game finishing, or `/quit`), then cancels the other.
 - **Keyboard input uses no threads.** `Terminal` calls `loop.add_reader(stdin_fd, ...)`, which registers stdin with the same epoll-based event loop that watches the socket. A thread blocked in `input()` couldn't be cancelled, so the player couldn't exit at game end until Enter was pressed.
 - **Half-typed lines survive.** The terminal is put in **cbreak mode**: keystrokes arrive one at a time, without echo, and `Terminal` keeps the line buffer itself. Before printing an incoming message it clears the input line (`\r\x1b[K`), prints the message, then redraws the prompt and your partial input. In the terminal's normal mode the kernel holds the half-typed line, where the program can't read or redraw it.
+- **Reconnecting is invisible to these tasks.** If the link breaks, `client.recv()` just waits while commslib reconnects, and `client.send()` queues. The player prints "Lost the link … Reconnecting" and then "Reconnected … Catching up", followed by the missed messages.
 - **Bots** (`--bot`) replace the keyboard task. Each reaction runs as its own task, so a bot's simulated thinking delay never stops the socket from being read.
 
 ### 5.3 What breaks with blocking I/O
@@ -198,26 +233,26 @@ for t in pending:
 |---|---|
 | Moderator reads players in turn (`recv(p1)`, `recv(p2)`, ...) | A quiet or absent player blocks the whole game. Wolves' coordination and chat sit unread behind them. |
 | Blocking reads without a timeout | One hung player (still connected, never sending) stalls the game forever. |
-| Discussion timer as `time.sleep()` | Chat freezes for the whole discussion. The event loop is blocked too, so commslib's reader tasks can't drain sockets, buffers fill, and players' sends stall. |
+| Discussion timer as `time.sleep()` | Chat freezes for the whole discussion. The event loop is blocked too, so commslib's reader and heartbeat tasks stop; buffers fill, and peers declare the moderator dead. |
 | Player uses `input()` | Moderator messages (including the 45s `NIGHT_PROMPT`) stay unread until Enter is pressed, so a player can miss their turn without ever seeing the prompt. After `GAME_OVER` the process can't exit until Enter. |
 | Player does a blocking socket `recv()` | Typed commands aren't processed until the moderator happens to send something. |
 
 ### 5.4 Signals and clean shutdown
 
-- **Moderator.** The lobby and game run as one task, `session()`. `loop.add_signal_handler(SIGINT/SIGTERM, task.cancel)` turns Ctrl-C or `kill` into a `CancelledError` at whatever `await` the game is paused on, usually `recv_any`, so game state is never half-updated. `main()` then broadcasts an aborted `GAME_OVER` (3s limit) and calls `Server.close()`. Without this, SIGTERM would end the process immediately, with no `GAME_OVER` and with socket files left behind.
-- **Player.** It exits when `GAME_OVER` arrives. SIGTERM/SIGHUP cancel its tasks, and a `finally` block restores the terminal mode and closes the connection.
+- **Moderator.** The lobby and game run as one task, `session()`. `loop.add_signal_handler(SIGINT/SIGTERM, task.cancel)` turns Ctrl-C or `kill` into a `CancelledError` at whatever `await` the game is paused on, usually `recv_any`, so game state is never half-updated. `main()` then broadcasts an aborted `GAME_OVER` (3s limit) and calls `Server.close()`. Without this, SIGTERM would end the process immediately: no `GAME_OVER`, and every player would spend two minutes trying to reconnect.
+- **Player.** It exits when `GAME_OVER` arrives. SIGTERM/SIGHUP cancel its tasks, and a `finally` block restores the terminal mode and closes the connection with `BYE`, so the moderator knows at once that the player left rather than holding the seat.
 - **`run_game.sh`.** It starts bots under `setsid`, so a Ctrl-C in the moderator's terminal reaches only the moderator. The bots learn of the shutdown the proper way, through `GAME_OVER`.
 
 ## 6. Game flow and rules
 
 ```
  lobby ──► ROLE_ASSIGN (1:1 each) ──► ┌─► NIGHT: NIGHT_PROMPT ─► collect actions ─► DAY_ANNOUNCE ─► win? ──yes──► GAME_OVER
- (wait_for_players)                   │        (multicast/1:1)   (message_loop, deadline)         │no
+ (logs joins, rejections)             │        (multicast/1:1)   (message_loop, deadline)         │no
                                       │                                                           ▼
                                       └── win? ◄── VOTE_TALLY ◄── VOTE: collect votes ◄── DAY: discussion (CHAT relay)
                                           │yes     (broadcast)     (ends early)              (full timer)
                                           ▼
-                                       GAME_OVER (broadcast, reveals all roles)
+                                       GAME_OVER (broadcast, reveals all roles) ──► wait for delivery ──► close
 ```
 
 The rules live in `roles.py`, which does no I/O, separately from the state machine in `moderator.py`.
@@ -233,34 +268,38 @@ The rules live in `roles.py`, which does no I/O, separately from the state machi
 | Night result | The wolves' victim dies unless the Doctor protected them (`resolve_night`). Roles are not revealed on death. |
 | **Day vote** | The most votes is eliminated (a plurality). **A tie, or no votes, eliminates nobody** (`tally_votes`). Votes are final, self-votes are rejected, silence counts as abstaining. |
 | Spectators | Dead players receive broadcasts (`PHASE`, `DAY_ANNOUNCE`, `VOTE_TALLY`, `GAME_OVER`) but not `CHAT`. Anything they send gets an error. |
-| **Win check** after every night and every day | The village wins when no wolves are alive. The wolves win when living wolves ≥ everyone else (`check_winner`). `--max-rounds` (20) or everyone disconnecting ends the game as a draw. |
+| **Win check** after every night and every day | The village wins when no wolves are alive. The wolves win when living wolves ≥ everyone else (`check_winner`). `--max-rounds` (20) or everyone leaving ends the game as a draw. |
 
 ## 7. Module boundaries
 
 | File | Knows about | Doesn't know about |
 |---|---|---|
-| `commslib.py` | sockets, framing, asyncio streams, SO_PEERCRED | the game |
+| `commslib.py` | TCP, TLS, framing, heartbeats, sessions, asyncio streams | the game |
 | `roles.py` | roles and rules | networking, timing |
-| `moderator.py` | game state, phases, routing decisions | raw sockets (uses only `Server`) |
-| `player.py` | display, keyboard, bot moves | raw sockets (uses only `Client`), other players' roles |
+| `moderator.py` | game state, phases, routing decisions | sockets, TLS, reconnects (uses only `Server`) |
+| `player.py` | display, keyboard, bot moves | sockets, TLS, reconnects (uses only `Client`), other players' roles |
 
-`test_day.py` runs the real `Game` class against a `FakeServer`. The fake has the same methods as `commslib.Server` but no sockets. This shows the game logic depends only on commslib's interface, not on how it is implemented.
+`test_day.py` runs the real `Game` class against a `FakeServer`. The fake has the same methods as `commslib.Server` but no sockets. This shows the game logic depends only on commslib's interface, not on how it is implemented. That's also why Project 2 could replace UNIX sockets with TCP + TLS, heartbeats and reconnection with only small changes to `moderator.py` and `player.py`.
 
 ## 8. Testing
 
 | Test | What it shows |
 |---|---|
-| `ping_server.py` / `ping_client.py` | commslib alone: 1:1, multicast, broadcast, a `recv_any` timeout, and a 300 KB frame arriving intact |
-| `test_permissions.sh` (sudo) | Socket isolation between real users, and SO_PEERCRED rejection |
+| `test_commslib.py` | commslib alone, over TLS: framing; malformed and oversized frames rejected; handshake refusals; socket options; heartbeats; replay after a partition in both directions with no duplicates; takeover; expiry |
+| `test_tls.sh` (sudo for the full 21 checks) | Who gets a seat: missing, foreign, stolen or wrong-seat certificates refused; impostor moderators refused; key ownership as real users |
 | `test_no_role_leak.py` | No role information ever reaches a villager, across full 6-player games |
 | `test_night.py` | A night ends early when everyone acts; a silent Seer gets a no-op at the deadline without affecting the others; the Doctor no-repeat rule |
 | `test_day.py` | Majority vote, ties, abstaining at the vote deadline, spectators' restrictions, chat relayed *during* the discussion timer |
-| `test_game.py` | Full games reach a winner consistent with `check_winner`; everyone gets `GAME_OVER` and exits 0; no socket files are left; SIGTERM/SIGINT to the moderator and SIGTERM to a player mid-game all shut down cleanly |
-| `README.md` § Testing | Manual procedure: a bot game and a multi-terminal human game as real Linux users, plus breakage tests |
+| `test_game.py` | Full games reach a winner consistent with `check_winner`; everyone gets `GAME_OVER` and exits 0; the port is released; signals shut down cleanly; a frozen player resumes with exactly the messages everyone else got |
+| `test_deploy.sh` (podman) | `deploy_remote.sh` over real ssh/scp/sudo to other "hosts", and a game across three hosts |
+| `test_faults.sh` (podman) | Latency and loss (`tc netem`), and partitions mid-night and mid-vote (`iptables DROP`): timeouts fire, players resume, the game finishes |
+| `ping_server.py` / `ping_client.py` | commslib alone: 1:1, multicast, broadcast, a `recv_any` timeout, and a 300 KB frame arriving intact |
 
 ## 9. Known limitations
 
-- **Disconnected players stay "alive"** for win checks and voting. There is no reconnect support.
+- **Identity is possession of the key.** Root, or anyone holding a copied key, can take that seat.
+- **A session survives network failures, not a player process restart:** the token is only in memory. A player gone for longer than `--resume-timeout` stays "alive" but silent for the rest of the game.
+- **No limit on concurrent unauthenticated connections** (each is bounded to 5s + 5s).
 - **The terminal input has no line editing or history.** Arrow keys are ignored.
 - **The moderator's console prints every role** (the "god view"). It must not be shown to players.
 - **A Ctrl-C during the moderator's first moment of startup**, before its signal handler is installed, ends it with a plain `KeyboardInterrupt`. `run_game.sh` then stops the waiting bots after 10s.

@@ -36,7 +36,7 @@ A text-based Werewolf (Mafia) game for 4–6 players. A moderator process runs t
 | `run_game.sh` | One command for a whole game on this machine (moderator + bots; prints commands for humans). |
 | `deploy_remote.sh`, `run_players.sh` | Install a seat's code and key on another machine over ssh; start that machine's seats. |
 | `test_*.py`, `test_*.sh`, `testnet.py`, `cluster.sh`, `tls_*.py`, `ping_*.py` | Tests and test helpers (see Testing). |
-| `DISTRIBUTED.md` | The protocol and design in detail. `ARCHITECTURE.md` is the Project 1 design document. |
+| `ARCHITECTURE.md`, `DISTRIBUTED.md` | The design: an overview (topology, the communication primitive, identity, messages, concurrency, rules), and the wire protocol in full detail. |
 
 The public API of `commslib.py`:
 
