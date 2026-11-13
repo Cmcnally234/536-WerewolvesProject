@@ -21,6 +21,13 @@
 
 set -uo pipefail
 
+# The logs hold secrets: the moderator's log has every role, and each
+# player's log has that player's role, Seer results, wolf whispers. They live
+# in /tmp, which every local user can reach, so every file this script
+# creates starts out private (0600 / 0700) -- including the moderator's log
+# that `tee` writes and the bots' output files the shell redirects into.
+umask 077
+
 APP_DIR=/opt/werewolf
 TLS=/etc/werewolf/tls
 HOST=""
@@ -75,7 +82,10 @@ kind_of() {
 }
 
 LOG_DIR=$(mktemp -d /tmp/werewolf-players.XXXXXX)
-chmod 0755 "$LOG_DIR"
+# 0711, not 0755: the bots (running as playerN) must be able to pass through
+# the directory to write their own log, but nobody may list it, and each
+# file inside is readable only by its owner.
+chmod 0711 "$LOG_DIR"
 NET=(--host "$HOST" --port "$PORT" --tls "$TLS")
 
 echo "== werewolf on $(hostname): seats ${SEATS[*]} -> moderator $HOST:$PORT, logs in $LOG_DIR =="
@@ -102,7 +112,8 @@ for s in "${SEATS[@]}"; do
     mode=act
     [[ $kind == silent ]] && mode=silent
     # The bot opens --log itself, as $s, so create the file with that owner.
-    install -o "$s" -m 0644 /dev/null "$LOG_DIR/$s.jsonl"
+    # 0600: no other seat on this machine may read it.
+    install -o "$s" -m 0600 /dev/null "$LOG_DIR/$s.jsonl"
     # setsid + all fds redirected, as in run_game.sh: Ctrl-C here reaches
     # only this script, which then ends the bots properly (cleanup).
     setsid sudo -u "$s" python3 "$APP_DIR/player.py" "$s" "${NET[@]}" \
@@ -126,5 +137,6 @@ for s in "${!BOT_PID[@]}"; do
 done
 trap - EXIT
 [[ -n ${SUDO_USER:-} ]] && chown -R "$SUDO_USER" "$LOG_DIR"
+chmod 0700 "$LOG_DIR"     # the game is over: the logs are the operator's alone
 echo "  logs: $LOG_DIR  ($(printf '%s.out ' "${SEATS[@]}")and .jsonl = raw messages received)"
 exit "$STATUS"

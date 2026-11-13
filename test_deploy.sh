@@ -94,6 +94,26 @@ sleep 1
 cx ww-pa /opt/werewolf/run_players.sh --host ww-mod --port 5555 player3 player4 \
     > $WORK/pa.out 2>&1 &
 PA=$!
+# The game's logs are in /tmp, which every local user can reach: nobody but
+# each file's owner may read them (the moderator's log has every role; a
+# player's log has that player's role and secrets). Checked while the lobby
+# still waits for player5, so the game can't have started -- or ended.
+for _ in $(seq 100); do
+    grep -q "joined (4/5)" "$WORK/mod.out" 2>/dev/null && break
+    sleep 0.1
+done
+echo "-- log privacy, while players are at the table --"
+expect 0 "711 600 600" "logs: directory 0711; moderator and player logs 0600" \
+    cx ww-mod bash -c 'd=$(ls -d /tmp/werewolf-run.*); stat -c %a "$d" "$d/moderator.out" "$d/player1.jsonl" | xargs'
+expect 1 "Permission denied" "player2 can't read the moderator's log (every role)" \
+    cx ww-mod bash -c 'sudo -u player2 cat /tmp/werewolf-run.*/moderator.out'
+expect 1 "Permission denied" "player2 can't read player1's log" \
+    cx ww-mod bash -c 'sudo -u player2 cat /tmp/werewolf-run.*/player1.jsonl'
+expect 2 "Permission denied" "an outsider (nobody) can't even list the log directory" \
+    cx ww-mod bash -c 'sudo -u nobody ls /tmp/werewolf-run.*/'
+expect 1 "Permission denied" "on ww-pa, player4 can't read player3's log" \
+    cx ww-pa bash -c 'sudo -u player4 cat /tmp/werewolf-players.*/player3.jsonl'
+
 cx ww-pb /opt/werewolf/run_players.sh --host ww-mod --port 5555 player5 \
     > $WORK/pb.out 2>&1 &
 PB=$!

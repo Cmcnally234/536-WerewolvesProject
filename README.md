@@ -117,6 +117,7 @@ sudo firewall-cmd --permanent --add-port=5555/tcp && sudo firewall-cmd --reload 
 - **Identity comes from the verified certificate**, never from a message. The seat is the certificate's CN; the `HELLO` naming a different seat is refused. Each key is readable only by its own Linux user, so only that user can take the seat.
 - **Session tokens.** A seat's session gets a random 128-bit token (`secrets`), compared in constant time; only that token resumes it after a network failure.
 - **Before authentication:** the TLS handshake and the `HELLO` each get 5 s; frames over 1 MiB, malformed JSON and protocol violations close the connection. There is no limit on the number of concurrent unauthenticated connections.
+- **Game logs are private.** `run_game.sh` and `run_players.sh` keep their logs in `/tmp/werewolf-run.*/` and `/tmp/werewolf-players.*/`, which every local user can reach, so the directory is `0711` (nobody can list it) and every file is `0600`, readable only by its owner. The moderator's log holds every role, and each player's log holds that player's secrets. After the game the logs are handed to whoever ran `sudo`, still private.
 - There is no plaintext mode and no flag or variable that turns TLS or verification off. Threat model, failure model and protocol details: `DISTRIBUTED.md` ("Handshake", "Failure model"). There is no separate `SECURITY.md`.
 
 ## Testing
@@ -130,7 +131,7 @@ sudo firewall-cmd --permanent --add-port=5555/tcp && sudo firewall-cmd --reload 
 | `python3 test_game.py` | whole games; signals; a frozen player resumes; a player gone too long is dropped | — | `all game tests passed` |
 | `./test_tls.sh` | who gets a seat: missing, foreign, stolen or wrong-seat certificates refused; impostor moderators refused | — | `14 passed, 0 failed` |
 | `sudo ./test_tls.sh` | the same, plus key ownership as the real users | root, after `setup_users.sh` | `21 passed, 0 failed` |
-| `./test_deploy.sh` | `deploy_remote.sh` over real ssh/scp/sudo to other "hosts"; a game across three hosts | podman | `19 passed, 0 failed` |
+| `./test_deploy.sh` | `deploy_remote.sh` over real ssh/scp/sudo to other "hosts"; private game logs; a game across three hosts | podman | `24 passed, 0 failed` |
 | `./test_faults.sh` | `tc netem` latency + loss; `iptables DROP` partitions mid-night and mid-vote: timeouts fire, players resume, game finishes | podman | `18 passed, 0 failed` |
 
 The tests without "root" run as your own user over localhost. The two podman tests start three containers as separate hosts (the first run builds a Fedora image, so it needs network access), and no real second machine is needed. There is no `test_fuzz.py`; malformed-input handling is covered in `test_commslib.py`.

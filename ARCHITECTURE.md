@@ -130,6 +130,8 @@ TCP alone can't tell a *frozen* peer or a *silent partition* from a quiet one: t
 
 **Why that ties seats to Linux users:** `playerN`'s key is readable only by user `playerN` (mode `0600`, in a `0700` directory). So only that user, and root, can present that certificate. `sudo -u player2 ... player1` fails with `Permission denied` before it sends a byte. (Project 1 also asked the kernel for the connecting uid with SO_PEERCRED, which caught root too. Over TCP the kernel can't vouch for a remote user, so possession of the key is the proof.)
 
+**Game logs** are the one place game data touches the filesystem. `run_game.sh` and `run_players.sh` write them under `/tmp`, which every local user can reach. The moderator's log holds every role, and each player's log holds that player's role and secrets, so the scripts run under `umask 077`: the directory is `0711` (players can pass through it to write their own log, but nobody can list it), and every file is `0600`, readable only by its owner. After the game the directory becomes `0700` and is handed to whoever ran `sudo`. Before this fix (and in Project 1) the logs were world-readable, so any local user could read every role mid-game.
+
 **Before authentication** the moderator gives each connection 5s for the TLS handshake and 5s for the `HELLO`. Anything that fails is closed and logged as `_rejected`. `test_tls.sh` checks every case:
 - a valid certificate is accepted;
 - no certificate, a certificate from another CA, plain TCP, a certificate for no seat, and someone else's certificate are all refused;
@@ -291,7 +293,7 @@ The rules live in `roles.py`, which does no I/O, separately from the state machi
 | `test_night.py` | A night ends early when everyone acts; a silent Seer gets a no-op at the deadline without affecting the others; the Doctor no-repeat rule |
 | `test_day.py` | Majority vote, ties, abstaining at the vote deadline, spectators' restrictions, chat relayed *during* the discussion timer |
 | `test_game.py` | Full games reach a winner consistent with `check_winner`; everyone gets `GAME_OVER` and exits 0; the port is released; signals shut down cleanly; a frozen player resumes with exactly the messages everyone else got |
-| `test_deploy.sh` (podman) | `deploy_remote.sh` over real ssh/scp/sudo to other "hosts", and a game across three hosts |
+| `test_deploy.sh` (podman) | `deploy_remote.sh` over real ssh/scp/sudo to other "hosts"; game logs unreadable by other players and outsiders; a game across three hosts |
 | `test_faults.sh` (podman) | Latency and loss (`tc netem`), and partitions mid-night and mid-vote (`iptables DROP`): timeouts fire, players resume, the game finishes |
 | `ping_server.py` / `ping_client.py` | commslib alone: 1:1, multicast, broadcast, a `recv_any` timeout, and a 300 KB frame arriving intact |
 

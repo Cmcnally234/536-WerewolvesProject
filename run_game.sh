@@ -33,6 +33,13 @@
 
 set -uo pipefail
 
+# The logs hold secrets: the moderator's log has every role, and each
+# player's log has that player's role, Seer results, wolf whispers. They live
+# in /tmp, which every local user can reach, so every file this script
+# creates starts out private (0600 / 0700) -- including the moderator's log
+# that `tee` writes and the bots' output files the shell redirects into.
+umask 077
+
 APP_DIR=/opt/werewolf
 SRC_DIR=$(dirname "$(readlink -f "$0")")
 
@@ -123,7 +130,10 @@ done
 # --- plan ----------------------------------------------------------------------
 
 LOG_DIR=$(mktemp -d /tmp/werewolf-run.XXXXXX)
-chmod 0755 "$LOG_DIR"
+# 0711, not 0755: the bots (running as playerN) must be able to pass through
+# the directory to write their own log, but nobody may list it, and each
+# file inside is readable only by its owner.
+chmod 0711 "$LOG_DIR"
 
 SEATS=()
 for i in $(seq 1 "$N"); do SEATS+=("player$i"); done
@@ -187,8 +197,8 @@ for i in $(seq 1 "$N"); do
     mode=act
     [[ $kind == silent ]] && mode=silent
     # The bot opens --log itself, as player$i, so create the file with that
-    # owner first (LOG_DIR belongs to root).
-    install -o "player$i" -m 0644 /dev/null "$LOG_DIR/player$i.jsonl"
+    # owner first (LOG_DIR belongs to root). 0600: no other player may read it.
+    install -o "player$i" -m 0600 /dev/null "$LOG_DIR/player$i.jsonl"
     # setsid: own session, so Ctrl-C in this terminal reaches only the
     # moderator. The bots then hear about the shutdown the proper way, via
     # the moderator's GAME_OVER. Redirecting every fd keeps sudo from
@@ -240,6 +250,7 @@ fi
 
 # Hand the logs to whoever ran sudo, so they can read them without root.
 [[ -n ${SUDO_USER:-} ]] && chown -R "$SUDO_USER" "$LOG_DIR"
+chmod 0700 "$LOG_DIR"     # the game is over: the logs are the operator's alone
 echo "  logs: $LOG_DIR  (moderator.out, playerN.out, playerN.jsonl = raw messages received)"
 
 BOT_PID=()     # all finished (or killed) above: nothing left for cleanup to kill
